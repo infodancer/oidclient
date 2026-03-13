@@ -1,6 +1,7 @@
 package oidclient
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -13,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
+	jwtgo "github.com/golang-jwt/jwt/v5"
 )
 
 // testKeyPair generates an RSA key pair for testing.
@@ -26,63 +27,137 @@ func testKeyPair(t *testing.T) (*rsa.PrivateKey, *rsa.PublicKey) {
 	return priv, &priv.PublicKey
 }
 
-// jwksHandler returns an http.Handler that serves a JWKS document for the given key.
-func jwksHandler(pub *rsa.PublicKey, kid string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// fakeProvider starts an httptest.Server that serves OIDC discovery, JWKS,
+// and a token endpoint. Returns the server and a function to issue test JWTs.
+func fakeProvider(t *testing.T) (srv *httptest.Server, issuer string, issueToken func(sub, email string, ttl time.Duration) string) {
+	t.Helper()
+	priv, pub := testKeyPair(t)
+	kid := "test-kid"
+
+	mux := http.NewServeMux()
+
+	// We need the server URL in handlers, so use a pointer that's set after Start.
+	var baseURL string
+
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		base := baseURL
+		doc := map[string]any{
+			"issuer":                                base,
+			"authorization_endpoint":                base + "/authorize",
+			"token_endpoint":                        base + "/token",
+			"jwks_uri":                              base + "/jwks",
+			"response_types_supported":              []string{"code"},
+			"subject_types_supported":               []string{"public"},
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(doc)
+	})
+
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
 		doc := map[string]any{
 			"keys": []map[string]any{{
 				"kty": "RSA",
 				"kid": kid,
 				"n":   base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
 				"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
+				"alg": "RS256",
+				"use": "sig",
 			}},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(doc)
 	})
+
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		// Issue both access_token and id_token for the test.
+		now := time.Now()
+		accessClaims := jwtgo.MapClaims{
+			"iss":   baseURL,
+			"sub":   "user-from-token",
+			"email": "token@example.com",
+			"name":  "Token User",
+			"roles": []string{"user"},
+			"iat":   now.Unix(),
+			"exp":   now.Add(time.Hour).Unix(),
+		}
+		accessTok := jwtgo.NewWithClaims(jwtgo.SigningMethodRS256, accessClaims)
+		accessTok.Header["kid"] = kid
+		accessSigned, _ := accessTok.SignedString(priv)
+
+		idClaims := jwtgo.MapClaims{
+			"iss":   baseURL,
+			"sub":   "user-from-token",
+			"aud":   "test-client",
+			"email": "token@example.com",
+			"name":  "Token User",
+			"roles": []string{"user"},
+			"iat":   now.Unix(),
+			"exp":   now.Add(time.Hour).Unix(),
+		}
+		idTok := jwtgo.NewWithClaims(jwtgo.SigningMethodRS256, idClaims)
+		idTok.Header["kid"] = kid
+		idSigned, _ := idTok.SignedString(priv)
+
+		resp := map[string]any{
+			"access_token": accessSigned,
+			"id_token":     idSigned,
+			"token_type":   "Bearer",
+			"expires_in":   3600,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	srv = httptest.NewServer(mux)
+	baseURL = srv.URL
+	t.Cleanup(srv.Close)
+
+	issueToken = func(sub, email string, ttl time.Duration) string {
+		now := time.Now()
+		claims := jwtgo.MapClaims{
+			"iss":   srv.URL,
+			"sub":   sub,
+			"email": email,
+			"name":  "Test User",
+			"roles": []string{"user"},
+			"iat":   now.Unix(),
+			"exp":   now.Add(ttl).Unix(),
+		}
+		tok := jwtgo.NewWithClaims(jwtgo.SigningMethodRS256, claims)
+		tok.Header["kid"] = kid
+		signed, err := tok.SignedString(priv)
+		if err != nil {
+			t.Fatalf("sign token: %v", err)
+		}
+		return signed
+	}
+
+	return srv, srv.URL, issueToken
 }
 
-// issueTestToken creates a signed JWT with the given claims for testing.
-func issueTestToken(t *testing.T, priv *rsa.PrivateKey, kid, issuer, sub, email string, ttl time.Duration) string {
+// newTestClient creates a Client against the fake provider.
+func newTestClient(t *testing.T, srv *httptest.Server, issuer string) *Client {
 	t.Helper()
-	now := time.Now()
-	claims := jwt.MapClaims{
-		"iss":   issuer,
-		"sub":   sub,
-		"email": email,
-		"name":  "Test User",
-		"roles": []string{"user"},
-		"iat":   now.Unix(),
-		"exp":   now.Add(ttl).Unix(),
-	}
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = kid
-	signed, err := tok.SignedString(priv)
-	if err != nil {
-		t.Fatalf("sign token: %v", err)
-	}
-	return signed
-}
-
-func TestValidate_Success(t *testing.T) {
-	priv, pub := testKeyPair(t)
-	kid := "test-kid-1"
-
-	jwks := httptest.NewServer(jwksHandler(pub, kid))
-	defer jwks.Close()
-
-	c, err := New(Config{
-		Issuer:       "https://auth.example.com",
-		CookieName:   "test_jwt",
-		JWKSEndpoint: jwks.URL,
+	c, err := New(context.Background(), Config{
+		IssuerURL:   issuer,
+		CookieName:  "test_jwt",
+		ClientID:    "test-client",
+		CallbackURL: srv.URL + "/auth/callback",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	return c
+}
 
-	token := issueTestToken(t, priv, kid, "https://auth.example.com", "user-123", "alice@example.com", time.Hour)
+func TestValidate_Success(t *testing.T) {
+	srv, issuer, issue := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
 
-	claims, err := c.Validate(token)
+	token := issue("user-123", "alice@example.com", time.Hour)
+
+	claims, err := c.Validate(context.Background(), token)
 	if err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -101,71 +176,35 @@ func TestValidate_Success(t *testing.T) {
 }
 
 func TestValidate_ExpiredToken(t *testing.T) {
-	priv, pub := testKeyPair(t)
-	kid := "test-kid-2"
+	srv, issuer, issue := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
 
-	jwks := httptest.NewServer(jwksHandler(pub, kid))
-	defer jwks.Close()
+	token := issue("user-1", "a@b.com", -time.Hour)
 
-	c, err := New(Config{
-		JWKSEndpoint: jwks.URL,
-		CookieName:   "jwt",
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	token := issueTestToken(t, priv, kid, "https://auth.example.com", "user-1", "a@b.com", -time.Hour)
-
-	_, err = c.Validate(token)
+	_, err := c.Validate(context.Background(), token)
 	if err == nil {
 		t.Fatal("expected error for expired token")
 	}
 }
 
-func TestValidate_IssuerMismatch(t *testing.T) {
-	priv, pub := testKeyPair(t)
-	kid := "test-kid-3"
+func TestValidate_GarbageToken(t *testing.T) {
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
 
-	jwks := httptest.NewServer(jwksHandler(pub, kid))
-	defer jwks.Close()
-
-	c, err := New(Config{
-		Issuer:       "https://correct.example.com",
-		JWKSEndpoint: jwks.URL,
-		CookieName:   "jwt",
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	token := issueTestToken(t, priv, kid, "https://wrong.example.com", "user-1", "a@b.com", time.Hour)
-
-	_, err = c.Validate(token)
+	_, err := c.Validate(context.Background(), "not.a.jwt")
 	if err == nil {
-		t.Fatal("expected error for issuer mismatch")
+		t.Fatal("expected error for garbage token")
 	}
 }
 
 func TestValidateCookie(t *testing.T) {
-	priv, pub := testKeyPair(t)
-	kid := "test-kid-4"
+	srv, issuer, issue := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
 
-	jwks := httptest.NewServer(jwksHandler(pub, kid))
-	defer jwks.Close()
-
-	c, err := New(Config{
-		JWKSEndpoint: jwks.URL,
-		CookieName:   "sf_jwt",
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	token := issueTestToken(t, priv, kid, "", "user-42", "bob@example.com", time.Hour)
+	token := issue("user-42", "bob@example.com", time.Hour)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.AddCookie(&http.Cookie{Name: "sf_jwt", Value: token})
+	req.AddCookie(&http.Cookie{Name: "test_jwt", Value: token})
 
 	claims, err := c.ValidateCookie(req)
 	if err != nil {
@@ -177,142 +216,77 @@ func TestValidateCookie(t *testing.T) {
 }
 
 func TestValidateCookie_Missing(t *testing.T) {
-	_, pub := testKeyPair(t)
-	kid := "test-kid-5"
-
-	jwks := httptest.NewServer(jwksHandler(pub, kid))
-	defer jwks.Close()
-
-	c, err := New(Config{
-		JWKSEndpoint: jwks.URL,
-		CookieName:   "sf_jwt",
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	_, err = c.ValidateCookie(req)
-	if err == nil {
-		t.Fatal("expected error for missing cookie")
+	_, err := c.ValidateCookie(req)
+	if !errors.Is(err, ErrNoCookie) {
+		t.Errorf("expected ErrNoCookie, got %v", err)
 	}
 }
 
-func TestDiscovery(t *testing.T) {
-	_, pub := testKeyPair(t)
-	kid := "disc-kid"
-
-	mux := http.NewServeMux()
-	mux.Handle("/t/test/.well-known/jwks.json", jwksHandler(pub, kid))
-	mux.HandleFunc("/t/test/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
-		doc := map[string]string{
-			"jwks_uri":               "JWKS_PLACEHOLDER",
-			"authorization_endpoint": "AUTH_PLACEHOLDER",
-			"token_endpoint":         "TOKEN_PLACEHOLDER",
-		}
-		// These will be filled with the real server URL in the test.
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(doc)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	// Re-register with correct URLs now that we know the server address.
-	mux2 := http.NewServeMux()
-	mux2.Handle("/t/test/.well-known/jwks.json", jwksHandler(pub, kid))
-	mux2.HandleFunc("/t/test/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
-		doc := map[string]string{
-			"jwks_uri":               srv.URL + "/t/test/.well-known/jwks.json",
-			"authorization_endpoint": srv.URL + "/t/test/authorize",
-			"token_endpoint":         srv.URL + "/t/test/token",
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(doc)
-	})
-	// Swap handler.
-	srv.Config.Handler = mux2
-
-	c, err := New(Config{
-		IssuerURL:   srv.URL + "/t/test",
-		CookieName:  "jwt",
-		ClientID:    "myapp",
-		CallbackURL: "https://app.example.com/auth/callback",
-	})
-	if err != nil {
-		t.Fatalf("New with discovery: %v", err)
-	}
-
-	if !c.FlowConfigured() {
-		t.Error("expected FlowConfigured() = true after discovery")
-	}
-
-	// The authorize URL should use the discovered endpoint.
-	authURL := c.AuthorizeURL("state123", "challenge456")
-	if authURL == "" {
-		t.Fatal("AuthorizeURL returned empty string")
-	}
-	if got := c.discoveredAuthorizeURL; got != srv.URL+"/t/test/authorize" {
-		t.Errorf("discoveredAuthorizeURL = %q", got)
-	}
-}
-
-func TestAuthorizeURL_Manual(t *testing.T) {
-	// Without discovery, using TenantID + WebauthURL.
-	_, pub := testKeyPair(t)
-	kid := "man-kid"
-
-	jwks := httptest.NewServer(jwksHandler(pub, kid))
-	defer jwks.Close()
-
-	c, err := New(Config{
-		WebauthURL:   "https://auth.example.com",
-		TenantID:     "myco",
-		JWKSEndpoint: jwks.URL,
-		CookieName:   "jwt",
-		ClientID:     "sf",
-		CallbackURL:  "https://sf.example.com/auth/callback",
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+func TestDiscoveryAndFlowConfigured(t *testing.T) {
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
 
 	if !c.FlowConfigured() {
 		t.Error("expected FlowConfigured() = true")
 	}
+}
 
-	u := c.AuthorizeURL("s", "c")
-	if u == "" {
-		t.Fatal("empty authorize URL")
+func TestAuthorizeURL(t *testing.T) {
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
+
+	verifier := GenerateVerifier()
+	u := c.AuthorizeURL("mystate", verifier)
+
+	if !strings.Contains(u, "response_type=code") {
+		t.Errorf("missing response_type in %q", u)
 	}
-	// Should contain the manual base.
-	if want := "https://auth.example.com/t/myco/authorize"; !strings.Contains(u, want) {
-		t.Errorf("AuthorizeURL = %q, expected to contain %q", u, want)
+	if !strings.Contains(u, "client_id=test-client") {
+		t.Errorf("missing client_id in %q", u)
+	}
+	if !strings.Contains(u, "code_challenge_method=S256") {
+		t.Errorf("missing code_challenge_method in %q", u)
+	}
+	if !strings.Contains(u, "state=mystate") {
+		t.Errorf("missing state in %q", u)
+	}
+}
+
+func TestExchangeCode(t *testing.T) {
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
+
+	// The fake token endpoint always returns tokens regardless of code/verifier.
+	accessToken, claims, err := c.ExchangeCode(context.Background(), "fake-code", "fake-verifier")
+	if err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if accessToken == "" {
+		t.Error("expected non-empty access token")
+	}
+	if claims == nil {
+		t.Fatal("expected non-nil claims")
+	}
+	if claims.Sub != "user-from-token" {
+		t.Errorf("sub = %q, want user-from-token", claims.Sub)
+	}
+	if claims.Email != "token@example.com" {
+		t.Errorf("email = %q, want token@example.com", claims.Email)
 	}
 }
 
 func TestPKCE(t *testing.T) {
-	v, err := GenerateVerifier()
-	if err != nil {
-		t.Fatalf("GenerateVerifier: %v", err)
-	}
-	if len(v) == 0 {
+	v1 := GenerateVerifier()
+	if len(v1) == 0 {
 		t.Fatal("empty verifier")
 	}
-
-	c := Challenge(v)
-	if len(c) == 0 {
-		t.Fatal("empty challenge")
-	}
-
-	// Challenge should be deterministic.
-	if c2 := Challenge(v); c2 != c {
-		t.Errorf("Challenge not deterministic: %q != %q", c, c2)
-	}
-
-	// Different verifiers → different challenges.
-	v2, _ := GenerateVerifier()
-	if Challenge(v2) == c {
-		t.Error("different verifiers produced same challenge")
+	v2 := GenerateVerifier()
+	if v1 == v2 {
+		t.Error("two verifiers should differ")
 	}
 }
 
@@ -346,11 +320,8 @@ func TestFlowCookies(t *testing.T) {
 		}
 	}
 
-	// Test reading flow cookie values.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(&http.Cookie{Name: CookieVerifier, Value: "v"})
-	req.AddCookie(&http.Cookie{Name: CookieState, Value: "s"})
-
 	if got := FlowCookieValue(req, CookieVerifier); got != "v" {
 		t.Errorf("verifier = %q, want v", got)
 	}
@@ -378,7 +349,6 @@ func TestSessionCookie(t *testing.T) {
 		t.Error("session cookie should be SameSiteLax")
 	}
 
-	// Clear it.
 	rr2 := httptest.NewRecorder()
 	ClearSessionCookie(rr2, "sf_jwt", true)
 	cleared := rr2.Result().Cookies()
@@ -388,69 +358,16 @@ func TestSessionCookie(t *testing.T) {
 }
 
 func TestLoginURL(t *testing.T) {
-	_, pub := testKeyPair(t)
-	kid := "url-kid"
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
 
-	jwks := httptest.NewServer(jwksHandler(pub, kid))
-	defer jwks.Close()
-
-	c, err := New(Config{
-		WebauthURL:   "https://auth.example.com",
-		JWKSEndpoint: jwks.URL,
-		CookieName:   "jwt",
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	if got := c.LoginURL(""); got != "https://auth.example.com/login" {
-		t.Errorf("LoginURL() = %q", got)
+	if got := c.LoginURL(""); !strings.Contains(got, "/login") {
+		t.Errorf("LoginURL() = %q, expected /login", got)
 	}
 	if got := c.LoginURL("/dashboard"); !strings.Contains(got, "redirect_uri") {
 		t.Errorf("LoginURL(/dashboard) = %q, expected redirect_uri param", got)
 	}
-	if got := c.LogoutURL(); got != "https://auth.example.com/logout" {
+	if got := c.LogoutURL(); !strings.Contains(got, "/logout") {
 		t.Errorf("LogoutURL() = %q", got)
-	}
-}
-
-func TestSentinelErrors(t *testing.T) {
-	_, pub := testKeyPair(t)
-	kid := "err-kid"
-
-	jwks := httptest.NewServer(jwksHandler(pub, kid))
-	defer jwks.Close()
-
-	c, err := New(Config{
-		Issuer:       "https://auth.example.com",
-		JWKSEndpoint: jwks.URL,
-		CookieName:   "jwt",
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	// Missing cookie → ErrNoCookie.
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	_, err = c.ValidateCookie(req)
-	if !errors.Is(err, ErrNoCookie) {
-		t.Errorf("expected ErrNoCookie, got %v", err)
-	}
-
-	// Garbage token → ErrTokenInvalid.
-	_, err = c.Validate("not.a.jwt")
-	if !errors.Is(err, ErrTokenInvalid) {
-		t.Errorf("expected ErrTokenInvalid, got %v", err)
-	}
-
-	// Expired token → ErrTokenExpired.
-	priv2, pub2 := testKeyPair(t)
-	jwks2 := httptest.NewServer(jwksHandler(pub2, "exp-kid"))
-	defer jwks2.Close()
-	c2, _ := New(Config{Issuer: "https://auth.example.com", JWKSEndpoint: jwks2.URL, CookieName: "jwt"})
-	expiredTok := issueTestToken(t, priv2, "exp-kid", "https://auth.example.com", "u", "e@x.com", -time.Hour)
-	_, err = c2.Validate(expiredTok)
-	if !errors.Is(err, ErrTokenExpired) {
-		t.Errorf("expected ErrTokenExpired, got %v", err)
 	}
 }

@@ -7,16 +7,19 @@
 > general-purpose OIDC relying party library for Go, consider
 > [coreos/go-oidc](https://github.com/coreos/go-oidc).
 
-OIDC relying party client for Go web applications. Handles the authorization
-code flow with PKCE against an OpenID Connect provider.
+OIDC relying party client for Go web applications. Wraps
+[coreos/go-oidc](https://github.com/coreos/go-oidc) for discovery, JWKS, and
+token verification, and [golang.org/x/oauth2](https://pkg.go.dev/golang.org/x/oauth2)
+for the authorization code flow with PKCE. Adds cookie helpers and a
+convenience API on top.
 
 ## Features
 
-- **OIDC autodiscovery** — fetches endpoints from `.well-known/openid-configuration`
-- **JWKS caching** — in-memory key cache with 1-hour TTL and automatic refresh on key ID miss
-- **RS256 JWT validation** — issuer checking, expiration enforcement, claims extraction
-- **PKCE (S256)** — verifier/challenge generation per RFC 7636
-- **Authorization code flow** — authorize URL construction and token exchange
+- **OIDC autodiscovery** via go-oidc `Provider`
+- **JWKS caching and key rotation** handled by go-oidc
+- **RS256 JWT validation** with issuer and expiry enforcement
+- **PKCE (S256)** via x/oauth2
+- **Authorization code flow** — authorize URL, token exchange, ID token verification
 - **Cookie helpers** — secure defaults for OAuth flow state and JWT session cookies
 
 ## Install
@@ -27,10 +30,10 @@ go get github.com/infodancer/oidclient
 
 ## Usage
 
-### With OIDC autodiscovery
+### Creating a client
 
 ```go
-client, err := oidclient.New(oidclient.Config{
+client, err := oidclient.New(ctx, oidclient.Config{
     IssuerURL:   "https://auth.example.com/t/mytenant",
     CookieName:  "myapp_jwt",
     ClientID:    "myapp",
@@ -38,34 +41,19 @@ client, err := oidclient.New(oidclient.Config{
 })
 ```
 
-### Manual configuration
-
-```go
-client, err := oidclient.New(oidclient.Config{
-    WebauthURL:   "https://auth.example.com",
-    TenantID:     "mytenant",
-    JWKSEndpoint: "https://auth.example.com/t/mytenant/.well-known/jwks.json",
-    Issuer:       "https://auth.example.com/t/mytenant",
-    CookieName:   "myapp_jwt",
-    ClientID:     "myapp",
-    CallbackURL:  "https://myapp.example.com/auth/callback",
-})
-```
-
 ### Starting the login flow
 
 ```go
 func handleLogin(w http.ResponseWriter, r *http.Request) {
-    verifier, _ := oidclient.GenerateVerifier()
+    verifier := oidclient.GenerateVerifier()
     state, _ := oidclient.GenerateNonce()
-    challenge := oidclient.Challenge(verifier)
     secure := oidclient.IsSecure(r)
 
     oidclient.SetFlowCookie(w, oidclient.CookieVerifier, verifier, secure)
     oidclient.SetFlowCookie(w, oidclient.CookieState, state, secure)
     oidclient.SetFlowCookie(w, oidclient.CookieRedirect, r.URL.RequestURI(), secure)
 
-    http.Redirect(w, r, client.AuthorizeURL(state, challenge), http.StatusFound)
+    http.Redirect(w, r, client.AuthorizeURL(state, verifier), http.StatusFound)
 }
 ```
 
@@ -80,14 +68,17 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
     }
 
     verifier := oidclient.FlowCookieValue(r, oidclient.CookieVerifier)
-    token, err := client.ExchangeCode(r.Context(), r.URL.Query().Get("code"), verifier)
+    accessToken, claims, err := client.ExchangeCode(r.Context(), r.URL.Query().Get("code"), verifier)
     if err != nil {
         http.Error(w, "auth failed", http.StatusBadGateway)
         return
     }
 
+    // claims.Sub, claims.Email, claims.Name, claims.Roles are available
+    // for user provisioning here.
+
     secure := oidclient.IsSecure(r)
-    oidclient.SetSessionCookie(w, client.CookieName(), token, secure)
+    oidclient.SetSessionCookie(w, client.CookieName(), accessToken, secure)
     oidclient.ClearFlowCookies(w)
 
     redirectTo := oidclient.FlowCookieValue(r, oidclient.CookieRedirect)
