@@ -1,6 +1,14 @@
 # oidclient
 
-OIDC relying party library for Go web applications. Designed for use with [infodancer/webauth](https://github.com/infodancer/webauth) but compatible with any spec-compliant OpenID Connect provider.
+> **Experimental — internal use.** This library is developed for
+> [infodancer](https://github.com/infodancer) projects that authenticate
+> against [infodancer/webauth](https://github.com/infodancer/webauth). The API
+> is unstable and may change without notice. If you're looking for a
+> general-purpose OIDC relying party library for Go, consider
+> [coreos/go-oidc](https://github.com/coreos/go-oidc).
+
+OIDC relying party client for Go web applications. Handles the authorization
+code flow with PKCE against an OpenID Connect provider.
 
 ## Features
 
@@ -108,4 +116,4 @@ func requireAuth(next http.Handler) http.Handler {
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

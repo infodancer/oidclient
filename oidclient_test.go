@@ -5,9 +5,11 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,8 +177,7 @@ func TestValidateCookie(t *testing.T) {
 }
 
 func TestValidateCookie_Missing(t *testing.T) {
-	priv, pub := testKeyPair(t)
-	_ = priv
+	_, pub := testKeyPair(t)
 	kid := "test-kid-5"
 
 	jwks := httptest.NewServer(jwksHandler(pub, kid))
@@ -198,8 +199,7 @@ func TestValidateCookie_Missing(t *testing.T) {
 }
 
 func TestDiscovery(t *testing.T) {
-	priv, pub := testKeyPair(t)
-	_ = priv
+	_, pub := testKeyPair(t)
 	kid := "disc-kid"
 
 	mux := http.NewServeMux()
@@ -258,8 +258,7 @@ func TestDiscovery(t *testing.T) {
 
 func TestAuthorizeURL_Manual(t *testing.T) {
 	// Without discovery, using TenantID + WebauthURL.
-	priv, pub := testKeyPair(t)
-	_ = priv
+	_, pub := testKeyPair(t)
 	kid := "man-kid"
 
 	jwks := httptest.NewServer(jwksHandler(pub, kid))
@@ -286,8 +285,8 @@ func TestAuthorizeURL_Manual(t *testing.T) {
 		t.Fatal("empty authorize URL")
 	}
 	// Should contain the manual base.
-	if got := "https://auth.example.com/t/myco/authorize"; !contains(u, got) {
-		t.Errorf("AuthorizeURL = %q, expected to contain %q", u, got)
+	if want := "https://auth.example.com/t/myco/authorize"; !strings.Contains(u, want) {
+		t.Errorf("AuthorizeURL = %q, expected to contain %q", u, want)
 	}
 }
 
@@ -389,8 +388,7 @@ func TestSessionCookie(t *testing.T) {
 }
 
 func TestLoginURL(t *testing.T) {
-	priv, pub := testKeyPair(t)
-	_ = priv
+	_, pub := testKeyPair(t)
 	kid := "url-kid"
 
 	jwks := httptest.NewServer(jwksHandler(pub, kid))
@@ -408,7 +406,7 @@ func TestLoginURL(t *testing.T) {
 	if got := c.LoginURL(""); got != "https://auth.example.com/login" {
 		t.Errorf("LoginURL() = %q", got)
 	}
-	if got := c.LoginURL("/dashboard"); !contains(got, "redirect_uri") {
+	if got := c.LoginURL("/dashboard"); !strings.Contains(got, "redirect_uri") {
 		t.Errorf("LoginURL(/dashboard) = %q, expected redirect_uri param", got)
 	}
 	if got := c.LogoutURL(); got != "https://auth.example.com/logout" {
@@ -416,15 +414,43 @@ func TestLoginURL(t *testing.T) {
 	}
 }
 
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && containsStr(s, sub))
-}
+func TestSentinelErrors(t *testing.T) {
+	_, pub := testKeyPair(t)
+	kid := "err-kid"
 
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
+	jwks := httptest.NewServer(jwksHandler(pub, kid))
+	defer jwks.Close()
+
+	c, err := New(Config{
+		Issuer:       "https://auth.example.com",
+		JWKSEndpoint: jwks.URL,
+		CookieName:   "jwt",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-	return false
+
+	// Missing cookie → ErrNoCookie.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	_, err = c.ValidateCookie(req)
+	if !errors.Is(err, ErrNoCookie) {
+		t.Errorf("expected ErrNoCookie, got %v", err)
+	}
+
+	// Garbage token → ErrTokenInvalid.
+	_, err = c.Validate("not.a.jwt")
+	if !errors.Is(err, ErrTokenInvalid) {
+		t.Errorf("expected ErrTokenInvalid, got %v", err)
+	}
+
+	// Expired token → ErrTokenExpired.
+	priv2, pub2 := testKeyPair(t)
+	jwks2 := httptest.NewServer(jwksHandler(pub2, "exp-kid"))
+	defer jwks2.Close()
+	c2, _ := New(Config{Issuer: "https://auth.example.com", JWKSEndpoint: jwks2.URL, CookieName: "jwt"})
+	expiredTok := issueTestToken(t, priv2, "exp-kid", "https://auth.example.com", "u", "e@x.com", -time.Hour)
+	_, err = c2.Validate(expiredTok)
+	if !errors.Is(err, ErrTokenExpired) {
+		t.Errorf("expected ErrTokenExpired, got %v", err)
+	}
 }

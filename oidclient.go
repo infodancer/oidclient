@@ -11,6 +11,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -21,6 +22,16 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+)
+
+// Sentinel errors returned by Validate and ValidateCookie.
+var (
+	ErrNoCookie       = errors.New("oidclient: missing auth cookie")
+	ErrTokenInvalid   = errors.New("oidclient: invalid token")
+	ErrTokenExpired   = errors.New("oidclient: token expired")
+	ErrIssuerMismatch = errors.New("oidclient: issuer mismatch")
+	ErrMissingSub     = errors.New("oidclient: token missing sub claim")
+	ErrKeyNotFound    = errors.New("oidclient: public key not found")
 )
 
 // Claims holds the JWT claims extracted from an access or ID token.
@@ -143,6 +154,9 @@ func (c *Client) AuthorizeURL(state, challenge string) string {
 
 // ExchangeCode exchanges an authorization code for an access token.
 // verifier is the PKCE code_verifier used to derive the challenge.
+// Only the access_token is returned; the id_token and refresh_token from the
+// token response are intentionally discarded — the access token JWT is used
+// directly as the session credential.
 func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (string, error) {
 	tokenURL := c.discoveredTokenURL
 	if tokenURL == "" {
@@ -186,30 +200,36 @@ func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (strin
 }
 
 // ValidateCookie extracts the JWT from the session cookie and validates it.
+// Returns ErrNoCookie if the cookie is absent.
 func (c *Client) ValidateCookie(r *http.Request) (*Claims, error) {
 	cookie, err := r.Cookie(c.cfg.CookieName)
 	if err != nil {
-		return nil, fmt.Errorf("missing auth cookie")
+		return nil, ErrNoCookie
 	}
 	return c.Validate(cookie.Value)
 }
 
 // Validate parses and validates a raw JWT string, returning extracted claims.
+// Returns ErrTokenInvalid, ErrTokenExpired, ErrIssuerMismatch, or ErrMissingSub
+// on the corresponding failure conditions.
 func (c *Client) Validate(tokenStr string) (*Claims, error) {
 	tok, err := jwt.Parse(tokenStr, c.keyFunc, jwt.WithExpirationRequired())
 	if err != nil {
-		return nil, fmt.Errorf("invalid token: %w", err)
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, fmt.Errorf("%w: %w", ErrTokenExpired, err)
+		}
+		return nil, fmt.Errorf("%w: %w", ErrTokenInvalid, err)
 	}
 
 	mapClaims, ok := tok.Claims.(jwt.MapClaims)
 	if !ok || !tok.Valid {
-		return nil, fmt.Errorf("invalid token claims")
+		return nil, ErrTokenInvalid
 	}
 
 	if c.cfg.Issuer != "" {
 		iss, _ := mapClaims["iss"].(string)
 		if iss != c.cfg.Issuer {
-			return nil, fmt.Errorf("token issuer mismatch: got %q, want %q", iss, c.cfg.Issuer)
+			return nil, fmt.Errorf("%w: got %q, want %q", ErrIssuerMismatch, iss, c.cfg.Issuer)
 		}
 	}
 
@@ -220,7 +240,7 @@ func (c *Client) Validate(tokenStr string) (*Claims, error) {
 		Roles: stringSliceClaim(mapClaims, "roles"),
 	}
 	if claims.Sub == "" {
-		return nil, fmt.Errorf("token missing sub claim")
+		return nil, ErrMissingSub
 	}
 	return claims, nil
 }
@@ -275,7 +295,7 @@ func (c *Client) keyFunc(token *jwt.Token) (any, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("public key not found for kid %q", kid)
+	return nil, fmt.Errorf("%w: kid %q", ErrKeyNotFound, kid)
 }
 
 func (c *Client) findKey(kid string) (*rsa.PublicKey, bool) {
