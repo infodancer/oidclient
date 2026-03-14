@@ -98,9 +98,17 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("oidclient: discovery failed: %w", err)
 	}
 
+	// Explicitly set AuthStyleInParams: public PKCE clients send client_id
+	// in the form body per RFC 6749 §2.3.  Leaving AuthStyle as Unknown
+	// causes the oauth2 library to probe with Basic auth first, which can
+	// consume single-use auth codes on providers that delete before
+	// validating client_id.
+	endpoint := provider.Endpoint()
+	endpoint.AuthStyle = oauth2.AuthStyleInParams
+
 	oauth2Cfg := oauth2.Config{
 		ClientID:    cfg.ClientID,
-		Endpoint:    provider.Endpoint(),
+		Endpoint:    endpoint,
 		RedirectURL: cfg.CallbackURL,
 		Scopes:      []string{oidc.ScopeOpenID, "email", "profile"},
 	}
