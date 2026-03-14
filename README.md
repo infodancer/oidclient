@@ -7,11 +7,13 @@
 > general-purpose OIDC relying party library for Go, consider
 > [coreos/go-oidc](https://github.com/coreos/go-oidc).
 
-OIDC relying party client for Go web applications. Wraps
-[coreos/go-oidc](https://github.com/coreos/go-oidc) for discovery, JWKS, and
-token verification, and [golang.org/x/oauth2](https://pkg.go.dev/golang.org/x/oauth2)
-for the authorization code flow with PKCE. Adds cookie helpers and a
-convenience API on top.
+A thin convenience wrapper around
+[coreos/go-oidc](https://github.com/coreos/go-oidc) and
+[golang.org/x/oauth2](https://pkg.go.dev/golang.org/x/oauth2) that bundles
+OIDC discovery, JWKS-based JWT validation, the authorization code flow with
+PKCE, and cookie management into a single `Client` type. No custom
+cryptography — all signing and verification is delegated to go-oidc and
+go-jose.
 
 ## Features
 
