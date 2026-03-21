@@ -9,6 +9,8 @@ package oidclient
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -147,6 +149,33 @@ func (c *Client) FlowConfigured() bool {
 // challenge is computed automatically.
 func (c *Client) AuthorizeURL(state, verifier string) string {
 	return c.oauth2Cfg.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier))
+}
+
+// RegisterURL builds the URL to the IdP's registration page with the OIDC
+// parameters needed to complete an authorization code flow after signup.
+// The verifier is the same PKCE code verifier used with ExchangeCode.
+// After registration, the IdP redirects to CallbackURL with an authorization
+// code, identical to the login flow.
+func (c *Client) RegisterURL(state, verifier string) string {
+	u, err := url.Parse(c.cfg.IssuerURL + "/register")
+	if err != nil {
+		return c.cfg.IssuerURL + "/register"
+	}
+	q := u.Query()
+	q.Set("client_id", c.cfg.ClientID)
+	q.Set("redirect_uri", c.cfg.CallbackURL)
+	q.Set("scope", "openid email profile")
+	q.Set("state", state)
+	q.Set("code_challenge", s256Challenge(verifier))
+	q.Set("code_challenge_method", "S256")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// s256Challenge computes the S256 PKCE code challenge from a verifier.
+func s256Challenge(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
 // ExchangeCode exchanges an authorization code for tokens using the PKCE

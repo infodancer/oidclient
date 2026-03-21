@@ -357,6 +357,51 @@ func TestSessionCookie(t *testing.T) {
 	}
 }
 
+func TestRegisterURL(t *testing.T) {
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
+
+	verifier := GenerateVerifier()
+	u := c.RegisterURL("mystate", verifier)
+
+	if !strings.Contains(u, "/register") {
+		t.Errorf("RegisterURL() = %q, expected /register path", u)
+	}
+	if !strings.Contains(u, "client_id=test-client") {
+		t.Errorf("missing client_id in %q", u)
+	}
+	if !strings.Contains(u, "redirect_uri=") {
+		t.Errorf("missing redirect_uri in %q", u)
+	}
+	if !strings.Contains(u, "code_challenge_method=S256") {
+		t.Errorf("missing code_challenge_method in %q", u)
+	}
+	if !strings.Contains(u, "code_challenge=") {
+		t.Errorf("missing code_challenge in %q", u)
+	}
+	if !strings.Contains(u, "state=mystate") {
+		t.Errorf("missing state in %q", u)
+	}
+	if !strings.Contains(u, "scope=openid+email+profile") {
+		t.Errorf("missing scope in %q", u)
+	}
+}
+
+func TestS256Challenge(t *testing.T) {
+	// The challenge must be deterministic for a given verifier.
+	v := "test-verifier"
+	c1 := s256Challenge(v)
+	c2 := s256Challenge(v)
+	if c1 != c2 {
+		t.Errorf("challenge not deterministic: %q != %q", c1, c2)
+	}
+	// Different verifiers produce different challenges.
+	c3 := s256Challenge("other-verifier")
+	if c1 == c3 {
+		t.Error("different verifiers should produce different challenges")
+	}
+}
+
 func TestLoginURL(t *testing.T) {
 	srv, issuer, _ := fakeProvider(t)
 	c := newTestClient(t, srv, issuer)
