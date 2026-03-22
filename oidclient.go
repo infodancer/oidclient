@@ -8,11 +8,14 @@
 package oidclient
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 
@@ -127,13 +130,20 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		SkipClientIDCheck: true,
 	})
 
-	return &Client{
+	c := &Client{
 		cfg:            cfg,
 		provider:       provider,
 		oauth2Cfg:      oauth2Cfg,
 		idVerifier:     idVerifier,
 		accessVerifier: accessVerifier,
-	}, nil
+	}
+
+	// Auto-register with the IdP if dynamic client registration is supported.
+	if cfg.ClientID != "" && cfg.CallbackURL != "" {
+		c.autoRegister(ctx)
+	}
+
+	return c, nil
 }
 
 // CookieName returns the configured session cookie name.
@@ -261,4 +271,51 @@ func (c *Client) LoginURL(redirectPath string) string {
 // LogoutURL returns the IdP logout URL.
 func (c *Client) LogoutURL() string {
 	return c.cfg.WebauthURL + "/logout"
+}
+
+// autoRegister attempts RFC 7591 dynamic client registration with the IdP.
+// Failures are logged but not fatal — the client may already be registered,
+// or the IdP may not support dynamic registration.
+func (c *Client) autoRegister(ctx context.Context) {
+	// Extract registration_endpoint from the discovery document.
+	var disco struct {
+		RegistrationEndpoint string `json:"registration_endpoint"`
+	}
+	if err := c.provider.Claims(&disco); err != nil || disco.RegistrationEndpoint == "" {
+		return
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"client_id":     c.cfg.ClientID,
+		"client_name":   c.cfg.ClientID,
+		"redirect_uris": []string{c.cfg.CallbackURL},
+	})
+
+	httpClient := c.cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, disco.RegistrationEndpoint, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("oidclient: auto-register: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("oidclient: auto-register: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// 201 Created or 200 OK (already exists) are both fine.
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+		log.Printf("oidclient: registered client %q with %s", c.cfg.ClientID, disco.RegistrationEndpoint)
+	} else if resp.StatusCode == http.StatusConflict {
+		log.Printf("oidclient: client %q already registered", c.cfg.ClientID)
+	} else {
+		log.Printf("oidclient: auto-register returned %d", resp.StatusCode)
+	}
 }

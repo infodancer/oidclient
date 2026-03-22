@@ -416,3 +416,82 @@ func TestLoginURL(t *testing.T) {
 		t.Errorf("LogoutURL() = %q", got)
 	}
 }
+
+func TestAutoRegister(t *testing.T) {
+	priv, pub := testKeyPair(t)
+	kid := "test-kid"
+	var baseURL string
+	var registered bool
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		doc := map[string]any{
+			"issuer":                                baseURL,
+			"authorization_endpoint":                baseURL + "/authorize",
+			"token_endpoint":                        baseURL + "/token",
+			"jwks_uri":                              baseURL + "/jwks",
+			"registration_endpoint":                 baseURL + "/register-client",
+			"response_types_supported":              []string{"code"},
+			"subject_types_supported":               []string{"public"},
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(doc)
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		doc := map[string]any{
+			"keys": []map[string]any{{
+				"kty": "RSA",
+				"kid": kid,
+				"n":   base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
+				"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
+				"alg": "RS256",
+				"use": "sig",
+			}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(doc)
+	})
+	mux.HandleFunc("/register-client", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req map[string]any
+		json.NewDecoder(r.Body).Decode(&req)
+		if req["client_id"] != "auto-test" {
+			t.Errorf("unexpected client_id: %v", req["client_id"])
+		}
+		registered = true
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(req)
+	})
+
+	srv := httptest.NewServer(mux)
+	baseURL = srv.URL
+	t.Cleanup(srv.Close)
+	_ = priv // silence unused
+
+	_, err := New(context.Background(), Config{
+		IssuerURL:   baseURL,
+		CookieName:  "test_jwt",
+		ClientID:    "auto-test",
+		CallbackURL: srv.URL + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if !registered {
+		t.Error("expected auto-registration to be called")
+	}
+}
+
+func TestAutoRegister_NoEndpoint(t *testing.T) {
+	// Standard fakeProvider has no registration_endpoint — auto-register should be a no-op.
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
+	// Just verify the client was created without error.
+	if c == nil {
+		t.Fatal("expected non-nil client")
+	}
+}
