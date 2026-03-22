@@ -29,10 +29,11 @@ var (
 
 // Claims holds the JWT claims extracted from an ID or access token.
 type Claims struct {
-	Sub   string   `json:"sub"`
-	Email string   `json:"email"`
-	Name  string   `json:"name"`
-	Roles []string `json:"roles,omitempty"`
+	Sub           string   `json:"sub"`
+	Email         string   `json:"email"`
+	EmailVerified bool     `json:"email_verified,omitempty"`
+	Name          string   `json:"name"`
+	Roles         []string `json:"roles,omitempty"`
 }
 
 // Config configures the OIDC client.
