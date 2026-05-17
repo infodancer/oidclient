@@ -1,0 +1,36 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  settings:
+    errcheck:
+      # Functions whose error returns we deliberately ignore project-
+      # wide. Best-effort cleanup or stdout/stderr writes where there
+      # is nothing useful to do with the returned error.
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (io.ReadCloser).Close
+        - (*os.File).Close
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+    staticcheck:
+      checks:
+        - all
+        # The !(A && B) form is often clearer than the De-Morganed
+        # equivalent; opt out of the quick-fix suggestion.
+        - -QF1001
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt

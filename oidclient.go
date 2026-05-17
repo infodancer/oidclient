@@ -310,12 +310,12 @@ func (c *Client) autoRegister(ctx context.Context) {
 	}
 	defer resp.Body.Close()
 
-	// 201 Created or 200 OK (already exists) are both fine.
-	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusCreated, http.StatusOK:
 		log.Printf("oidclient: registered client %q with %s", c.cfg.ClientID, disco.RegistrationEndpoint)
-	} else if resp.StatusCode == http.StatusConflict {
+	case http.StatusConflict:
 		log.Printf("oidclient: client %q already registered", c.cfg.ClientID)
-	} else {
+	default:
 		log.Printf("oidclient: auto-register returned %d", resp.StatusCode)
 	}
 }
