@@ -1,5 +1,10 @@
 # oidclient
 
+[![CI](https://github.com/infodancer/oidclient/actions/workflows/ci.yml/badge.svg)](https://github.com/infodancer/oidclient/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/infodancer/oidclient.svg)](https://pkg.go.dev/github.com/infodancer/oidclient)
+[![Go Report Card](https://goreportcard.com/badge/github.com/infodancer/oidclient)](https://goreportcard.com/report/github.com/infodancer/oidclient)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 > **Experimental — internal use.** This library is developed for
 > [infodancer](https://github.com/infodancer) projects that authenticate
 > against [infodancer/webauth](https://github.com/infodancer/webauth). The API
@@ -109,4 +114,5 @@ func requireAuth(next http.Handler) http.Handler {
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE). Vulnerability reporting in
+[SECURITY.md](SECURITY.md).
