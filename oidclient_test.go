@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -417,11 +418,33 @@ func TestLoginURL(t *testing.T) {
 	}
 }
 
-func TestAutoRegister(t *testing.T) {
+// registrationRecord captures what the fake registration endpoint received
+// and what it should send back.
+type registrationRecord struct {
+	rawBody       []byte
+	parsedBody    map[string]any
+	responseID    string
+	responseExtra map[string]any // e.g. client_secret
+	responseCode  int            // 201 or 200; 0 means use 201
+	responseError string         // if set, returns this with responseCode (default 400)
+}
+
+// tokenCapture records the form values sent to the fake token endpoint so
+// tests can assert which client_id / client_secret were used during exchange.
+type tokenCapture struct {
+	clientID     string
+	clientSecret string
+}
+
+// fakeProviderWithRegistration starts a fake OIDC provider that advertises a
+// registration_endpoint and captures registration requests.
+func fakeProviderWithRegistration(t *testing.T, rec *registrationRecord) (srv *httptest.Server, issuer string, tokCap *tokenCapture) {
+	t.Helper()
 	priv, pub := testKeyPair(t)
 	kid := "test-kid"
+	tokCap = &tokenCapture{}
+
 	var baseURL string
-	var registered bool
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
@@ -438,6 +461,7 @@ func TestAutoRegister(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(doc)
 	})
+
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
 		doc := map[string]any{
 			"keys": []map[string]any{{
@@ -452,46 +476,244 @@ func TestAutoRegister(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(doc)
 	})
+
 	mux.HandleFunc("/register-client", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		var req map[string]any
-		json.NewDecoder(r.Body).Decode(&req)
-		if req["client_id"] != "auto-test" {
-			t.Errorf("unexpected client_id: %v", req["client_id"])
+		body, _ := io.ReadAll(r.Body)
+		rec.rawBody = body
+		parsed := map[string]any{}
+		json.Unmarshal(body, &parsed)
+		rec.parsedBody = parsed
+
+		if rec.responseError != "" {
+			code := rec.responseCode
+			if code == 0 {
+				code = http.StatusBadRequest
+			}
+			http.Error(w, rec.responseError, code)
+			return
 		}
-		registered = true
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(req)
+
+		code := rec.responseCode
+		if code == 0 {
+			code = http.StatusCreated
+		}
+		resp := map[string]any{"client_id": rec.responseID}
+		for k, v := range rec.responseExtra {
+			resp[k] = v
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(resp)
 	})
 
-	srv := httptest.NewServer(mux)
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		tokCap.clientID = r.PostForm.Get("client_id")
+		tokCap.clientSecret = r.PostForm.Get("client_secret")
+
+		now := time.Now()
+		// Audience must match the actual client_id used in the request, since
+		// oidclient verifies aud == ClientID on the ID token.
+		aud := tokCap.clientID
+		if aud == "" {
+			aud = "unknown"
+		}
+		claims := jwtgo.MapClaims{
+			"iss": baseURL, "sub": "test", "aud": aud,
+			"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
+		}
+		tok := jwtgo.NewWithClaims(jwtgo.SigningMethodRS256, claims)
+		tok.Header["kid"] = kid
+		signed, _ := tok.SignedString(priv)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": signed, "id_token": signed,
+			"token_type": "Bearer", "expires_in": 3600,
+		})
+	})
+
+	srv = httptest.NewServer(mux)
 	baseURL = srv.URL
 	t.Cleanup(srv.Close)
-	_ = priv // silence unused
+	return srv, srv.URL, tokCap
+}
+
+func TestAutoRegistration_RequestBodyOmitsClientID(t *testing.T) {
+	rec := &registrationRecord{responseID: "server-assigned-id"}
+	srv, issuer, _ := fakeProviderWithRegistration(t, rec)
 
 	_, err := New(context.Background(), Config{
-		IssuerURL:   baseURL,
+		IssuerURL:   issuer,
 		CookieName:  "test_jwt",
-		ClientID:    "auto-test",
+		ClientID:    "caller-preference",
+		ClientName:  "My App",
 		CallbackURL: srv.URL + "/auth/callback",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if !registered {
-		t.Error("expected auto-registration to be called")
+
+	if _, ok := rec.parsedBody["client_id"]; ok {
+		t.Errorf("registration body must not include client_id (RFC 7591 §3.1); got body %s", rec.rawBody)
+	}
+	if got := rec.parsedBody["client_name"]; got != "My App" {
+		t.Errorf("client_name = %v, want %q", got, "My App")
+	}
+	uris, _ := rec.parsedBody["redirect_uris"].([]any)
+	if len(uris) != 1 || uris[0] != srv.URL+"/auth/callback" {
+		t.Errorf("redirect_uris = %v, want [%s/auth/callback]", uris, srv.URL)
 	}
 }
 
-func TestAutoRegister_NoEndpoint(t *testing.T) {
-	// Standard fakeProvider has no registration_endpoint — auto-register should be a no-op.
+func TestAutoRegistration_UsesServerAssignedID(t *testing.T) {
+	rec := &registrationRecord{responseID: "server-assigned-id"}
+	srv, issuer, tokCap := fakeProviderWithRegistration(t, rec)
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:   issuer,
+		CookieName:  "test_jwt",
+		ClientID:    "caller-preference",
+		CallbackURL: srv.URL + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.ClientID() != "server-assigned-id" {
+		t.Errorf("Client.ClientID() = %q, want server-assigned-id", c.ClientID())
+	}
+	if !strings.Contains(c.AuthorizeURL("s", "v"), "client_id=server-assigned-id") {
+		t.Errorf("AuthorizeURL should use server-assigned id")
+	}
+
+	if _, _, err := c.ExchangeCode(context.Background(), "code", "verifier"); err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if tokCap.clientID != "server-assigned-id" {
+		t.Errorf("token request client_id = %q, want server-assigned-id", tokCap.clientID)
+	}
+}
+
+func TestAutoRegistration_UsesServerAssignedSecret(t *testing.T) {
+	rec := &registrationRecord{
+		responseID:    "confidential-client",
+		responseExtra: map[string]any{"client_secret": "super-secret"},
+	}
+	srv, issuer, tokCap := fakeProviderWithRegistration(t, rec)
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:   issuer,
+		CookieName:  "test_jwt",
+		CallbackURL: srv.URL + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, _, err := c.ExchangeCode(context.Background(), "code", "verifier"); err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if tokCap.clientSecret != "super-secret" {
+		t.Errorf("token request client_secret = %q, want super-secret", tokCap.clientSecret)
+	}
+}
+
+func TestAutoRegistration_EmptyClientNameOmitted(t *testing.T) {
+	rec := &registrationRecord{responseID: "id"}
+	srv, issuer, _ := fakeProviderWithRegistration(t, rec)
+
+	_, err := New(context.Background(), Config{
+		IssuerURL:   issuer,
+		CookieName:  "test_jwt",
+		CallbackURL: srv.URL + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, ok := rec.parsedBody["client_name"]; ok {
+		t.Errorf("client_name should be omitted when empty (omitempty); got body %s", rec.rawBody)
+	}
+}
+
+func TestAutoRegistration_AlreadyRegistered200(t *testing.T) {
+	rec := &registrationRecord{
+		responseID:   "stable-id",
+		responseCode: http.StatusOK,
+	}
+	srv, issuer, _ := fakeProviderWithRegistration(t, rec)
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:   issuer,
+		CookieName:  "test_jwt",
+		CallbackURL: srv.URL + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.ClientID() != "stable-id" {
+		t.Errorf("Client.ClientID() = %q, want stable-id", c.ClientID())
+	}
+}
+
+func TestAutoRegistration_NoEndpoint(t *testing.T) {
+	// fakeProvider does NOT advertise a registration_endpoint.
 	srv, issuer, _ := fakeProvider(t)
-	c := newTestClient(t, srv, issuer)
-	// Just verify the client was created without error.
-	if c == nil {
-		t.Fatal("expected non-nil client")
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:   issuer,
+		CookieName:  "test_jwt",
+		ClientID:    "pre-registered-id",
+		CallbackURL: srv.URL + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.ClientID() != "pre-registered-id" {
+		t.Errorf("Client.ClientID() = %q, want pre-registered-id (caller config used as-is)", c.ClientID())
+	}
+}
+
+func TestAutoRegistration_ServerError(t *testing.T) {
+	rec := &registrationRecord{
+		responseCode:  http.StatusInternalServerError,
+		responseError: "internal explosion",
+	}
+	srv, issuer, _ := fakeProviderWithRegistration(t, rec)
+
+	_, err := New(context.Background(), Config{
+		IssuerURL:   issuer,
+		CookieName:  "test_jwt",
+		CallbackURL: srv.URL + "/auth/callback",
+	})
+	if err == nil {
+		t.Fatal("expected error from registration failure")
+	}
+	if !strings.Contains(err.Error(), "auto-registration failed") {
+		t.Errorf("error %q should wrap auto-registration failure", err)
+	}
+}
+
+func TestAutoRegistration_NoCallbackSkipsRegistration(t *testing.T) {
+	// When no CallbackURL is set the caller is not running the auth code flow
+	// (validation-only consumer); registration is skipped even if advertised.
+	rec := &registrationRecord{responseID: "would-not-be-used"}
+	_, issuer, _ := fakeProviderWithRegistration(t, rec)
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:  issuer,
+		CookieName: "test_jwt",
+		ClientID:   "validation-only",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if rec.parsedBody != nil {
+		t.Errorf("registration endpoint should not have been called; got body %s", rec.rawBody)
+	}
+	if c.ClientID() != "validation-only" {
+		t.Errorf("ClientID = %q, want validation-only", c.ClientID())
 	}
 }

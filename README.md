@@ -27,6 +27,7 @@ go-jose.
 - **RS256 JWT validation** with issuer and expiry enforcement
 - **PKCE (S256)** via x/oauth2
 - **Authorization code flow** — authorize URL, token exchange, ID token verification
+- **RFC 7591 dynamic client registration** — automatic at startup when the provider advertises it
 - **Cookie helpers** — secure defaults for OAuth flow state and JWT session cookies
 
 ## Install
@@ -43,10 +44,28 @@ go get github.com/infodancer/oidclient
 client, err := oidclient.New(ctx, oidclient.Config{
     IssuerURL:   "https://auth.example.com/t/mytenant",
     CookieName:  "myapp_jwt",
-    ClientID:    "myapp",
+    ClientID:    "myapp",       // pre-registered fallback; ignored if the provider supports RFC 7591
+    ClientName:  "My App",      // sent during dynamic registration (optional)
     CallbackURL: "https://myapp.example.com/auth/callback",
 })
 ```
+
+### Dynamic client registration (RFC 7591)
+
+If the provider's discovery document advertises `registration_endpoint`,
+`New` performs RFC 7591 dynamic client registration during startup, posts
+client metadata (`client_name`, `redirect_uris`), and uses the
+server-assigned `client_id` (and `client_secret`, if returned) for all
+subsequent operations. The runtime id is available via `client.ClientID()`
+for persistence across restarts:
+
+```go
+log.Printf("registered as client_id=%s", client.ClientID())
+```
+
+When the provider does not advertise `registration_endpoint`, `Config.ClientID`
+is used as-is — the manual-provisioning case (the OIDC client was registered
+out-of-band at the provider's admin console).
 
 ### Starting the login flow
 
