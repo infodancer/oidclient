@@ -57,6 +57,15 @@ type Config struct {
 	// screens. Ignored when the provider does not advertise a registration_endpoint.
 	ClientName string
 
+	// ClientSecret is the static secret for a confidential client (e.g. a Google
+	// "Web application" credential). Set it together with a pre-registered
+	// ClientID for providers that issue a secret and do not support RFC 7591
+	// dynamic registration; it is sent in the token-exchange request body
+	// alongside the PKCE verifier. Leave empty for public PKCE clients. When the
+	// provider advertises a registration_endpoint, dynamic registration runs and
+	// the server-assigned secret supersedes this value.
+	ClientSecret string
+
 	// CallbackURL is the registered redirect URI for the authorization code flow.
 	CallbackURL string
 
@@ -115,7 +124,9 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// client_id (and client_secret, if any) supersedes Config.ClientID for
 	// all subsequent operations: token exchange, ID-token audience checks,
 	// and any consumer that reads Client.ClientID.
-	var clientSecret string
+	// A static confidential client supplies its secret up front; dynamic
+	// registration (below) supersedes it when the provider supports RFC 7591.
+	clientSecret := cfg.ClientSecret
 	if cfg.CallbackURL != "" {
 		var meta struct {
 			RegistrationEndpoint string `json:"registration_endpoint"`
@@ -130,11 +141,13 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		}
 	}
 
-	// Explicitly set AuthStyleInParams: public PKCE clients send client_id
-	// in the form body per RFC 6749 §2.3.  Leaving AuthStyle as Unknown
-	// causes the oauth2 library to probe with Basic auth first, which can
-	// consume single-use auth codes on providers that delete before
-	// validating client_id.
+	// Explicitly set AuthStyleInParams: client_id (and, for a confidential
+	// client, client_secret) go in the token-request form body per RFC 6749
+	// §2.3.1. Leaving AuthStyle as Unknown causes the oauth2 library to probe
+	// with Basic auth first, which can consume single-use auth codes on
+	// providers that delete before validating client_id. Google accepts the
+	// secret in the body, so this style serves both public and confidential
+	// clients.
 	endpoint := provider.Endpoint()
 	endpoint.AuthStyle = oauth2.AuthStyleInParams
 

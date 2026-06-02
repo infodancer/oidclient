@@ -717,3 +717,108 @@ func TestAutoRegistration_NoCallbackSkipsRegistration(t *testing.T) {
 		t.Errorf("ClientID = %q, want validation-only", c.ClientID())
 	}
 }
+
+// confidentialProvider starts an OIDC provider that does NOT advertise dynamic
+// registration and records the client_secret presented at the token endpoint,
+// so a confidential-client test can assert the secret was actually sent.
+func confidentialProvider(t *testing.T, clientID string) (issuer string, gotSecret *string) {
+	t.Helper()
+	priv, pub := testKeyPair(t)
+	kid := "test-kid"
+	var baseURL string
+	secret := new(string)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		// No registration_endpoint: forces the static-client path.
+		doc := map[string]any{
+			"issuer":                                baseURL,
+			"authorization_endpoint":                baseURL + "/authorize",
+			"token_endpoint":                        baseURL + "/token",
+			"jwks_uri":                              baseURL + "/jwks",
+			"response_types_supported":              []string{"code"},
+			"subject_types_supported":               []string{"public"},
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(doc) //nolint:errcheck
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		doc := map[string]any{"keys": []map[string]any{{
+			"kty": "RSA", "kid": kid, "alg": "RS256", "use": "sig",
+			"n": base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
+		}}}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(doc) //nolint:errcheck
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		*secret = r.FormValue("client_secret")
+		now := time.Now()
+		mk := func(claims jwtgo.MapClaims) string {
+			tok := jwtgo.NewWithClaims(jwtgo.SigningMethodRS256, claims)
+			tok.Header["kid"] = kid
+			s, _ := tok.SignedString(priv)
+			return s
+		}
+		access := mk(jwtgo.MapClaims{"iss": baseURL, "sub": "g-1", "email": "user@gmail.com", "iat": now.Unix(), "exp": now.Add(time.Hour).Unix()})
+		id := mk(jwtgo.MapClaims{"iss": baseURL, "sub": "g-1", "aud": clientID, "email": "user@gmail.com", "email_verified": true, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix()})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"access_token": access, "id_token": id, "token_type": "Bearer", "expires_in": 3600,
+		})
+	})
+
+	srv := httptest.NewServer(mux)
+	baseURL = srv.URL
+	t.Cleanup(srv.Close)
+	return srv.URL, secret
+}
+
+func TestExchangeCode_ConfidentialClientSendsSecret(t *testing.T) {
+	const id, secret = "google-client", "google-secret-xyz"
+	issuer, gotSecret := confidentialProvider(t, id)
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:    issuer,
+		CookieName:   "test_jwt",
+		ClientID:     id,
+		ClientSecret: secret,
+		CallbackURL:  issuer + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.ClientID() != id {
+		t.Errorf("ClientID() = %q, want %q (static, no registration)", c.ClientID(), id)
+	}
+
+	if _, _, err := c.ExchangeCode(context.Background(), "fake-code", "fake-verifier"); err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if *gotSecret != secret {
+		t.Errorf("token endpoint received client_secret %q, want %q", *gotSecret, secret)
+	}
+}
+
+func TestExchangeCode_PublicClientSendsNoSecret(t *testing.T) {
+	const id = "public-client"
+	issuer, gotSecret := confidentialProvider(t, id)
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:   issuer,
+		CookieName:  "test_jwt",
+		ClientID:    id, // no ClientSecret → public PKCE client
+		CallbackURL: issuer + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, _, err := c.ExchangeCode(context.Background(), "fake-code", "fake-verifier"); err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if *gotSecret != "" {
+		t.Errorf("public client sent client_secret %q, want empty", *gotSecret)
+	}
+}
