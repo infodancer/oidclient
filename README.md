@@ -28,6 +28,7 @@ go-jose.
 - **PKCE (S256)** via x/oauth2
 - **Authorization code flow** — authorize URL, token exchange, ID token verification
 - **RFC 7591 dynamic client registration** — automatic at startup when the provider advertises it
+- **Static confidential clients** — set `ClientID` + `ClientSecret` for providers that issue a secret and don't support RFC 7591 (e.g. Google)
 - **Cookie helpers** — secure defaults for OAuth flow state and JWT session cookies
 
 ## Install
@@ -65,7 +66,12 @@ log.Printf("registered as client_id=%s", client.ClientID())
 
 When the provider does not advertise `registration_endpoint`, `Config.ClientID`
 is used as-is — the manual-provisioning case (the OIDC client was registered
-out-of-band at the provider's admin console).
+out-of-band at the provider's admin console). For a **confidential** client that
+also issues a secret (e.g. a Google "Web application" credential), set
+`Config.ClientSecret` alongside `ClientID`; it is sent in the token-exchange
+request body together with the PKCE verifier. Leave it empty for public PKCE
+clients. If the provider *does* advertise `registration_endpoint`, dynamic
+registration runs and the server-assigned secret supersedes `ClientSecret`.
 
 ### Starting the login flow
 
