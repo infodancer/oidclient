@@ -316,8 +316,8 @@ func TestFlowCookies(t *testing.T) {
 		if !c.HttpOnly {
 			t.Errorf("cookie %s should be HttpOnly", c.Name)
 		}
-		if c.MaxAge != FlowCookieMaxAge {
-			t.Errorf("cookie %s MaxAge = %d, want %d", c.Name, c.MaxAge, FlowCookieMaxAge)
+		if c.MaxAge != 0 || !c.Expires.IsZero() {
+			t.Errorf("cookie %s has expiry (MaxAge=%d), want session cookie", c.Name, c.MaxAge)
 		}
 	}
 
