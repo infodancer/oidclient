@@ -29,6 +29,30 @@ func SetFlowCookie(w http.ResponseWriter, name, value string, secure bool) {
 	})
 }
 
+// GetOrCreateFlow returns the state and PKCE verifier for the current
+// authorization flow, generating them and setting the flow cookies when no
+// flow is in progress. An existing flow (both state and verifier cookies
+// present) is reused, so concurrent unauthenticated requests share one flow
+// instead of overwriting the state another in-flight redirect depends on.
+// The redirect cookie is always set to returnTo: state and verifier are
+// per-flow, the post-login destination follows the latest request.
+func GetOrCreateFlow(w http.ResponseWriter, r *http.Request, returnTo string) (state, verifier string, err error) {
+	state = FlowCookieValue(r, CookieState)
+	verifier = FlowCookieValue(r, CookieVerifier)
+	secure := IsSecure(r)
+	if state == "" || verifier == "" {
+		verifier = GenerateVerifier()
+		state, err = GenerateNonce()
+		if err != nil {
+			return "", "", err
+		}
+		SetFlowCookie(w, CookieVerifier, verifier, secure)
+		SetFlowCookie(w, CookieState, state, secure)
+	}
+	SetFlowCookie(w, CookieRedirect, returnTo, secure)
+	return state, verifier, nil
+}
+
 // ClearFlowCookies expires all OIDC flow cookies.
 func ClearFlowCookies(w http.ResponseWriter) {
 	for _, name := range []string{CookieVerifier, CookieState, CookieRedirect} {
