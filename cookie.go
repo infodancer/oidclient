@@ -9,21 +9,20 @@ const (
 	CookieRedirect = "oauth_redirect"
 )
 
-// FlowCookieMaxAge is the lifetime in seconds for the short-lived OIDC flow cookies.
-const FlowCookieMaxAge = 300
-
 // IsSecure returns true if the request arrived over TLS or via an HTTPS proxy.
 func IsSecure(r *http.Request) bool {
 	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 }
 
-// SetFlowCookie writes a short-lived HttpOnly cookie used during the OIDC flow.
+// SetFlowCookie writes an HttpOnly cookie used during the OIDC flow. The
+// cookie is session-lifetime: the flow must survive however long the user
+// leaves the IdP's login page open, and the state/verifier nonces derive no
+// security from a fixed expiry -- the authorization code and PKCE binding do.
 func SetFlowCookie(w http.ResponseWriter, name, value string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     name,
 		Value:    value,
 		Path:     "/",
-		MaxAge:   FlowCookieMaxAge,
 		HttpOnly: true,
 		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
