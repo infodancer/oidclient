@@ -51,6 +51,16 @@ client, err := oidclient.New(ctx, oidclient.Config{
 })
 ```
 
+`New` contacts the provider synchronously and fails if it is unreachable. A
+web application that must boot even while its IdP is down should use
+`NewLazy` instead: it returns immediately, runs discovery in the background
+with exponential backoff, and degrades gracefully until the provider is
+reached -- `Ready()` reports false, `Validate`/`ExchangeCode` return
+`ErrNotReady` (treat as anonymous), `AuthorizeURL` returns `""` (check
+`Ready()` before starting a login flow), and `CallbackHandler` responds 503.
+An IdP outage then costs sign-in, not the whole site. The context passed to
+`NewLazy` must outlive the client; set `Config.Logf` to see retry diagnostics.
+
 ### Dynamic client registration (RFC 7591)
 
 If the provider's discovery document advertises `registration_endpoint`,

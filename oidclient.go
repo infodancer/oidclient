@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync/atomic"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -25,6 +27,11 @@ var (
 	ErrNoCookie   = errors.New("oidclient: missing auth cookie")
 	ErrNoIDToken  = errors.New("oidclient: token response missing id_token")
 	ErrMissingSub = errors.New("oidclient: token missing sub claim")
+
+	// ErrNotReady is returned by token operations on a [NewLazy] client whose
+	// provider discovery has not yet succeeded. Treat it as "anonymous" on
+	// validation paths and as "sign-in temporarily unavailable" on flow paths.
+	ErrNotReady = errors.New("oidclient: provider not ready")
 )
 
 // Claims holds the JWT claims extracted from an ID or access token.
@@ -76,6 +83,10 @@ type Config struct {
 	// HTTPClient overrides the default HTTP client for OIDC discovery, JWKS
 	// fetches, and token exchange requests.
 	HTTPClient *http.Client
+
+	// Logf receives diagnostic messages from [NewLazy]'s background discovery
+	// retries. Nil disables logging.
+	Logf func(format string, args ...any)
 }
 
 // Client is an OIDC relying party that performs authorization code flows with
@@ -85,18 +96,77 @@ type Config struct {
 // [github.com/coreos/go-oidc/v3]. The authorization code flow is handled by
 // [golang.org/x/oauth2].
 type Client struct {
-	cfg Config
+	cfg  Config
+	logf func(format string, args ...any)
 
+	// state holds everything derived from provider discovery (and dynamic
+	// registration). [New] populates it before returning; [NewLazy] leaves it
+	// nil and a background goroutine stores it when discovery first succeeds.
+	// Token operations fail with [ErrNotReady] while it is nil.
+	state atomic.Pointer[providerState]
+}
+
+// providerState is the discovery-derived half of a Client, swapped in
+// atomically once the provider has been reached.
+type providerState struct {
 	provider       *oidc.Provider
 	oauth2Cfg      oauth2.Config
 	idVerifier     *oidc.IDTokenVerifier // audience = ClientID (for ID tokens at callback)
 	accessVerifier *oidc.IDTokenVerifier // skip audience check (for access tokens per-request)
+	clientID       string                // server-assigned by dynamic registration, else Config.ClientID
 }
+
+// Lazy retry backoff bounds; see retryConnect.
+const (
+	lazyInitialBackoff = time.Second
+	lazyMaxBackoff     = time.Minute
+)
 
 // New creates a Client by performing OIDC discovery against the configured
 // IssuerURL. Returns an error if discovery fails or the configuration is
-// incomplete.
+// incomplete. Use [NewLazy] when the application must boot even while the
+// provider is unreachable.
 func New(ctx context.Context, cfg Config) (*Client, error) {
+	c, err := newClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	st, err := c.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.state.Store(st)
+	return c, nil
+}
+
+// NewLazy creates a Client without contacting the provider. Discovery (and
+// dynamic registration) run in a background goroutine, retrying with
+// exponential backoff until they succeed or ctx is cancelled, so an
+// unavailable IdP degrades sign-in instead of blocking application startup.
+//
+// Until the first success, Ready reports false, token operations return
+// [ErrNotReady], AuthorizeURL returns "", and CallbackHandler responds 503.
+// The error return covers static misconfiguration only.
+//
+// ctx must outlive the Client: it bounds both the retry loop and the
+// provider's later JWKS fetches.
+func NewLazy(ctx context.Context, cfg Config) (*Client, error) {
+	return newLazy(ctx, cfg, lazyInitialBackoff, lazyMaxBackoff)
+}
+
+// newLazy is NewLazy with injectable backoff bounds for tests.
+func newLazy(ctx context.Context, cfg Config, initial, max time.Duration) (*Client, error) {
+	c, err := newClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	go c.retryConnect(ctx, initial, max)
+	return c, nil
+}
+
+// newClient validates static configuration and builds the connection-free
+// half of a Client.
+func newClient(cfg Config) (*Client, error) {
 	if cfg.IssuerURL == "" {
 		return nil, fmt.Errorf("oidclient: IssuerURL is required")
 	}
@@ -108,13 +178,23 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		}
 	}
 
+	logf := cfg.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	return &Client{cfg: cfg, logf: logf}, nil
+}
+
+// connect performs discovery and dynamic registration, returning the derived
+// provider state. It does not mutate the Client.
+func (c *Client) connect(ctx context.Context) (*providerState, error) {
 	// Use custom HTTP client if provided.
 	provCtx := ctx
-	if cfg.HTTPClient != nil {
-		provCtx = oidc.ClientContext(ctx, cfg.HTTPClient)
+	if c.cfg.HTTPClient != nil {
+		provCtx = oidc.ClientContext(ctx, c.cfg.HTTPClient)
 	}
 
-	provider, err := oidc.NewProvider(provCtx, cfg.IssuerURL)
+	provider, err := oidc.NewProvider(provCtx, c.cfg.IssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("oidclient: discovery failed: %w", err)
 	}
@@ -126,17 +206,18 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// and any consumer that reads Client.ClientID.
 	// A static confidential client supplies its secret up front; dynamic
 	// registration (below) supersedes it when the provider supports RFC 7591.
-	clientSecret := cfg.ClientSecret
-	if cfg.CallbackURL != "" {
+	clientID := c.cfg.ClientID
+	clientSecret := c.cfg.ClientSecret
+	if c.cfg.CallbackURL != "" {
 		var meta struct {
 			RegistrationEndpoint string `json:"registration_endpoint"`
 		}
 		if err := provider.Claims(&meta); err == nil && meta.RegistrationEndpoint != "" {
-			info, err := autoRegister(provCtx, meta.RegistrationEndpoint, cfg.ClientName, cfg.CallbackURL, cfg.HTTPClient)
+			info, err := autoRegister(provCtx, meta.RegistrationEndpoint, c.cfg.ClientName, c.cfg.CallbackURL, c.cfg.HTTPClient)
 			if err != nil {
 				return nil, fmt.Errorf("oidclient: auto-registration failed: %w", err)
 			}
-			cfg.ClientID = info.ClientID
+			clientID = info.ClientID
 			clientSecret = info.ClientSecret
 		}
 	}
@@ -152,16 +233,16 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	endpoint.AuthStyle = oauth2.AuthStyleInParams
 
 	oauth2Cfg := oauth2.Config{
-		ClientID:     cfg.ClientID,
+		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		Endpoint:     endpoint,
-		RedirectURL:  cfg.CallbackURL,
+		RedirectURL:  c.cfg.CallbackURL,
 		Scopes:       []string{oidc.ScopeOpenID, "email", "profile"},
 	}
 
 	// ID token verifier: checks audience = ClientID.
 	idVerifier := provider.Verifier(&oidc.Config{
-		ClientID: cfg.ClientID,
+		ClientID: clientID,
 	})
 
 	// Access token verifier: skips audience check because webauth access
@@ -170,14 +251,40 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		SkipClientIDCheck: true,
 	})
 
-	return &Client{
-		cfg:            cfg,
+	return &providerState{
 		provider:       provider,
 		oauth2Cfg:      oauth2Cfg,
 		idVerifier:     idVerifier,
 		accessVerifier: accessVerifier,
+		clientID:       clientID,
 	}, nil
 }
+
+// retryConnect drives a lazy client to readiness: connect with exponential
+// backoff until success or ctx cancellation. The goroutine exits either way.
+func (c *Client) retryConnect(ctx context.Context, initial, max time.Duration) {
+	backoff := initial
+	for {
+		st, err := c.connect(ctx)
+		if err == nil {
+			c.state.Store(st)
+			c.logf("oidclient: provider ready: %s", c.cfg.IssuerURL)
+			return
+		}
+		c.logf("oidclient: provider unavailable (retry in %s): %v", backoff, err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, max)
+	}
+}
+
+// Ready reports whether provider discovery has completed. A client from [New]
+// is always ready; a client from [NewLazy] becomes ready when the background
+// retry first succeeds. While false, token operations return [ErrNotReady].
+func (c *Client) Ready() bool { return c.state.Load() != nil }
 
 // CookieName returns the configured session cookie name.
 func (c *Client) CookieName() string { return c.cfg.CookieName }
@@ -185,20 +292,31 @@ func (c *Client) CookieName() string { return c.cfg.CookieName }
 // ClientID returns the OIDC client ID in effect for this Client. When the
 // provider supports RFC 7591 dynamic registration, this is the server-assigned
 // id (which may differ from Config.ClientID); otherwise it is the pre-registered
-// id from Config.
-func (c *Client) ClientID() string { return c.cfg.ClientID }
+// id from Config. On a not-yet-ready lazy client it is the Config value.
+func (c *Client) ClientID() string {
+	if st := c.state.Load(); st != nil && st.clientID != "" {
+		return st.clientID
+	}
+	return c.cfg.ClientID
+}
 
 // FlowConfigured reports whether the OIDC authorization code flow is configured
 // (i.e., ClientID and CallbackURL are set).
 func (c *Client) FlowConfigured() bool {
-	return c.cfg.ClientID != "" && c.cfg.CallbackURL != ""
+	return c.ClientID() != "" && c.cfg.CallbackURL != ""
 }
 
 // AuthorizeURL builds the OIDC authorization URL with PKCE.
 // verifier is the PKCE code verifier (store it for the callback); the S256
-// challenge is computed automatically.
+// challenge is computed automatically. Returns "" while a lazy client is not
+// ready (the endpoints are unknown before discovery) — check [Client.Ready]
+// before starting a flow.
 func (c *Client) AuthorizeURL(state, verifier string) string {
-	return c.oauth2Cfg.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier))
+	st := c.state.Load()
+	if st == nil {
+		return ""
+	}
+	return st.oauth2Cfg.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier))
 }
 
 // RegisterURL builds the URL to the IdP's registration page with the OIDC
@@ -212,7 +330,7 @@ func (c *Client) RegisterURL(state, verifier string) string {
 		return c.cfg.IssuerURL + "/register"
 	}
 	q := u.Query()
-	q.Set("client_id", c.cfg.ClientID)
+	q.Set("client_id", c.ClientID())
 	q.Set("redirect_uri", c.cfg.CallbackURL)
 	q.Set("scope", "openid email profile")
 	q.Set("state", state)
@@ -232,11 +350,15 @@ func s256Challenge(verifier string) string {
 // verifier. Returns the access token (for session storage) and the verified
 // claims from the ID token.
 func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (accessToken string, claims *Claims, err error) {
+	st := c.state.Load()
+	if st == nil {
+		return "", nil, ErrNotReady
+	}
 	if c.cfg.HTTPClient != nil {
 		ctx = context.WithValue(ctx, oauth2.HTTPClient, c.cfg.HTTPClient)
 	}
 
-	tok, err := c.oauth2Cfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+	tok, err := st.oauth2Cfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return "", nil, fmt.Errorf("token exchange: %w", err)
 	}
@@ -246,7 +368,7 @@ func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (acces
 		return "", nil, ErrNoIDToken
 	}
 
-	idToken, err := c.idVerifier.Verify(ctx, rawIDToken)
+	idToken, err := st.idVerifier.Verify(ctx, rawIDToken)
 	if err != nil {
 		return "", nil, fmt.Errorf("verify ID token: %w", err)
 	}
@@ -274,9 +396,15 @@ func (c *Client) ValidateCookie(r *http.Request) (*Claims, error) {
 
 // Validate parses and validates a raw access token JWT, returning the
 // extracted claims. The token's signature is verified against the provider's
-// JWKS, and standard claims (issuer, expiry) are checked.
+// JWKS, and standard claims (issuer, expiry) are checked. Returns
+// [ErrNotReady] while a lazy client's discovery is pending — treat it as an
+// unauthenticated request.
 func (c *Client) Validate(ctx context.Context, tokenStr string) (*Claims, error) {
-	tok, err := c.accessVerifier.Verify(ctx, tokenStr)
+	st := c.state.Load()
+	if st == nil {
+		return nil, ErrNotReady
+	}
+	tok, err := st.accessVerifier.Verify(ctx, tokenStr)
 	if err != nil {
 		return nil, fmt.Errorf("oidclient: invalid token: %w", err)
 	}

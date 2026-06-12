@@ -32,10 +32,22 @@ func testKeyPair(t *testing.T) (*rsa.PrivateKey, *rsa.PublicKey) {
 // and a token endpoint. Returns the server and a function to issue test JWTs.
 func fakeProvider(t *testing.T) (srv *httptest.Server, issuer string, issueToken func(sub, email string, ttl time.Duration) string) {
 	t.Helper()
+	mux, setBase, issueToken := fakeProviderMux(t)
+	srv = httptest.NewServer(mux)
+	setBase(srv.URL)
+	t.Cleanup(srv.Close)
+	return srv, srv.URL, issueToken
+}
+
+// fakeProviderMux builds the fake IdP's handler without starting a server, so
+// tests can wrap it (e.g. behind an availability gate). setBase must be called
+// with the serving URL before the first request.
+func fakeProviderMux(t *testing.T) (mux *http.ServeMux, setBase func(string), issueToken func(sub, email string, ttl time.Duration) string) {
+	t.Helper()
 	priv, pub := testKeyPair(t)
 	kid := "test-kid"
 
-	mux := http.NewServeMux()
+	mux = http.NewServeMux()
 
 	// We need the server URL in handlers, so use a pointer that's set after Start.
 	var baseURL string
@@ -110,14 +122,12 @@ func fakeProvider(t *testing.T) (srv *httptest.Server, issuer string, issueToken
 		json.NewEncoder(w).Encode(resp)
 	})
 
-	srv = httptest.NewServer(mux)
-	baseURL = srv.URL
-	t.Cleanup(srv.Close)
+	setBase = func(b string) { baseURL = b }
 
 	issueToken = func(sub, email string, ttl time.Duration) string {
 		now := time.Now()
 		claims := jwtgo.MapClaims{
-			"iss":   srv.URL,
+			"iss":   baseURL,
 			"sub":   sub,
 			"email": email,
 			"name":  "Test User",
@@ -134,7 +144,7 @@ func fakeProvider(t *testing.T) (srv *httptest.Server, issuer string, issueToken
 		return signed
 	}
 
-	return srv, srv.URL, issueToken
+	return mux, setBase, issueToken
 }
 
 // newTestClient creates a Client against the fake provider.
