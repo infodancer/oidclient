@@ -40,6 +40,14 @@ func (c *Client) CallbackHandler(opts CallbackOptions) http.Handler {
 		logf = func(string, ...any) {}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A lazy client whose discovery is still pending cannot exchange the
+		// code; degrade this endpoint rather than the whole application.
+		if !c.Ready() {
+			logf("oidclient: callback received before provider discovery completed")
+			http.Error(w, "authentication temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+
 		if errParam := r.URL.Query().Get("error"); errParam != "" {
 			logf("oidclient: callback error from provider: %s", errParam)
 			http.Error(w, "authentication error", http.StatusUnauthorized)
