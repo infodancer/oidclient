@@ -10,4 +10,4 @@ on:
 
 jobs:
   ci:
-    uses: infodancer/workflows/.github/workflows/go-ci.yml@v0.2.0
+    uses: infodancer/workflows/.github/workflows/go-ci.yml@v0
