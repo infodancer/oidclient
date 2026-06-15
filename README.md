@@ -27,6 +27,7 @@ go-jose.
 - **RS256 JWT validation** with issuer and expiry enforcement
 - **PKCE (S256)** via x/oauth2
 - **Authorization code flow** — authorize URL, token exchange, ID token verification
+- **Session renewal** — `offline_access` opt-in, refresh-token grant with rotation handling, and proactive expiry via `Claims.ExpiresAt`
 - **RFC 7591 dynamic client registration** — automatic at startup when the provider advertises it
 - **Static confidential clients** — set `ClientID` + `ClientSecret` for providers that issue a secret and don't support RFC 7591 (e.g. Google)
 - **Cookie helpers** — secure defaults for OAuth flow state and JWT session cookies
@@ -55,8 +56,8 @@ client, err := oidclient.New(ctx, oidclient.Config{
 web application that must boot even while its IdP is down should use
 `NewLazy` instead: it returns immediately, runs discovery in the background
 with exponential backoff, and degrades gracefully until the provider is
-reached -- `Ready()` reports false, `Validate`/`ExchangeCode` return
-`ErrNotReady` (treat as anonymous), `AuthorizeURL` returns `""` (check
+reached -- `Ready()` reports false, token operations (`Validate`, `Exchange`,
+`Refresh`) return `ErrNotReady` (treat as anonymous), `AuthorizeURL` returns `""` (check
 `Ready()` before starting a login flow), and `CallbackHandler` responds 503.
 An IdP outage then costs sign-in, not the whole site. The context passed to
 `NewLazy` must outlive the client; set `Config.Logf` to see retry diagnostics.
@@ -110,17 +111,18 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
     }
 
     verifier := oidclient.FlowCookieValue(r, oidclient.CookieVerifier)
-    accessToken, claims, err := client.ExchangeCode(r.Context(), r.URL.Query().Get("code"), verifier)
+    tokens, claims, err := client.Exchange(r.Context(), r.URL.Query().Get("code"), verifier)
     if err != nil {
         http.Error(w, "auth failed", http.StatusBadGateway)
         return
     }
 
     // claims.Sub, claims.Email, claims.Name, claims.Roles are available
-    // for user provisioning here.
+    // for user provisioning here. When OfflineAccess is set, persist
+    // tokens.RefreshToken to a server-side session store to renew later.
 
     secure := oidclient.IsSecure(r)
-    oidclient.SetSessionCookie(w, client.CookieName(), accessToken, secure)
+    oidclient.SetSessionCookie(w, client.CookieName(), tokens.AccessToken, secure)
     oidclient.ClearFlowCookies(w)
 
     redirectTo := oidclient.FlowCookieValue(r, oidclient.CookieRedirect)
@@ -146,6 +148,29 @@ func requireAuth(next http.Handler) http.Handler {
     })
 }
 ```
+
+### Renewing a session
+
+Set `OfflineAccess: true` on the `Config` so the IdP issues a refresh token,
+then persist `tokens.RefreshToken` from `Exchange` (a long-lived, high-value
+credential — keep it server-side, not in a browser cookie). When the access
+token nears expiry, renew without an interactive redirect:
+
+```go
+newTokens, claims, err := client.Refresh(ctx, storedRefreshToken)
+if err != nil {
+    // ErrNoRefreshToken / a refused grant means the session cannot be
+    // renewed silently — fall back to a full login.
+    return
+}
+// The IdP may rotate the refresh token: store newTokens.RefreshToken and
+// discard the one just used, or the next Refresh fails replay detection.
+save(claims.Sub, newTokens.RefreshToken)
+oidclient.SetSessionCookie(w, client.CookieName(), newTokens.AccessToken, secure)
+```
+
+Renew proactively rather than waiting for a 401: `Claims.ExpiresAt()` exposes
+the access-token expiry, so a caller can refresh a minute ahead of time.
 
 ## License
 
