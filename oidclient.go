@@ -24,9 +24,10 @@ import (
 
 // Sentinel errors returned by Validate, ValidateCookie, and ExchangeCode.
 var (
-	ErrNoCookie   = errors.New("oidclient: missing auth cookie")
-	ErrNoIDToken  = errors.New("oidclient: token response missing id_token")
-	ErrMissingSub = errors.New("oidclient: token missing sub claim")
+	ErrNoCookie       = errors.New("oidclient: missing auth cookie")
+	ErrNoIDToken      = errors.New("oidclient: token response missing id_token")
+	ErrMissingSub     = errors.New("oidclient: token missing sub claim")
+	ErrNoRefreshToken = errors.New("oidclient: no refresh token")
 
 	// ErrNotReady is returned by token operations on a [NewLazy] client whose
 	// provider discovery has not yet succeeded. Treat it as "anonymous" on
@@ -41,6 +42,35 @@ type Claims struct {
 	EmailVerified bool     `json:"email_verified,omitempty"`
 	Name          string   `json:"name"`
 	Roles         []string `json:"roles,omitempty"`
+
+	// Exp is the token's expiry as a Unix timestamp (the JWT "exp" claim).
+	// Callers can use it to renew proactively -- via Refresh, before a request
+	// fails -- rather than reacting to a validation failure. Zero if the token
+	// carried no exp.
+	Exp int64 `json:"exp,omitempty"`
+}
+
+// ExpiresAt returns the token expiry as a time.Time, or the zero time if the
+// token carried no exp claim.
+func (c *Claims) ExpiresAt() time.Time {
+	if c.Exp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(c.Exp, 0)
+}
+
+// Tokens holds the credentials returned by a successful code exchange
+// ([Client.Exchange]) or renewal ([Client.Refresh]).
+//
+// RefreshToken is empty unless the IdP granted offline access (see
+// [Config.OfflineAccess]). On an IdP that rotates refresh tokens -- as webauth
+// does, with replay detection -- each Exchange/Refresh returns a *new*
+// RefreshToken and the caller MUST persist it, discarding the one just used;
+// reusing a rotated token trips replay detection and ends the session.
+type Tokens struct {
+	AccessToken  string
+	RefreshToken string
+	Expiry       time.Time
 }
 
 // Config configures the OIDC client.
@@ -75,6 +105,15 @@ type Config struct {
 
 	// CallbackURL is the registered redirect URI for the authorization code flow.
 	CallbackURL string
+
+	// OfflineAccess requests the "offline_access" scope so the IdP issues a
+	// refresh token, enabling session renewal via [Client.Refresh] without an
+	// interactive redirect. Leave false for short-lived sessions: a refresh
+	// token is a long-lived, high-value credential and a relying party that
+	// does not renew sessions should not request one. webauth gates refresh
+	// issuance on this scope; for Google, prefer a confidential client (offline
+	// issuance there keys off access_type, which this scope does not set).
+	OfflineAccess bool
 
 	// WebauthURL is the base URL of the auth server (e.g. "https://auth.example.com").
 	// Used for LoginURL/LogoutURL construction. Derived from IssuerURL if empty.
@@ -232,12 +271,17 @@ func (c *Client) connect(ctx context.Context) (*providerState, error) {
 	endpoint := provider.Endpoint()
 	endpoint.AuthStyle = oauth2.AuthStyleInParams
 
+	scopes := []string{oidc.ScopeOpenID, "email", "profile"}
+	if c.cfg.OfflineAccess {
+		scopes = append(scopes, oidc.ScopeOfflineAccess)
+	}
+
 	oauth2Cfg := oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		Endpoint:     endpoint,
 		RedirectURL:  c.cfg.CallbackURL,
-		Scopes:       []string{oidc.ScopeOpenID, "email", "profile"},
+		Scopes:       scopes,
 	}
 
 	// ID token verifier: checks audience = ClientID.
@@ -346,13 +390,16 @@ func s256Challenge(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(h[:])
 }
 
-// ExchangeCode exchanges an authorization code for tokens using the PKCE
-// verifier. Returns the access token (for session storage) and the verified
-// claims from the ID token.
-func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (accessToken string, claims *Claims, err error) {
+// Exchange exchanges an authorization code for tokens using the PKCE verifier.
+// It returns the [Tokens] (access token, refresh token when offline access was
+// granted, and access-token expiry) along with the verified claims from the ID
+// token. Persist Tokens.RefreshToken to renew the session later via
+// [Client.Refresh]; on a rotating IdP it must be stored, not the request-time
+// token.
+func (c *Client) Exchange(ctx context.Context, code, verifier string) (*Tokens, *Claims, error) {
 	st := c.state.Load()
 	if st == nil {
-		return "", nil, ErrNotReady
+		return nil, nil, ErrNotReady
 	}
 	if c.cfg.HTTPClient != nil {
 		ctx = context.WithValue(ctx, oauth2.HTTPClient, c.cfg.HTTPClient)
@@ -360,28 +407,108 @@ func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (acces
 
 	tok, err := st.oauth2Cfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
-		return "", nil, fmt.Errorf("token exchange: %w", err)
+		return nil, nil, fmt.Errorf("token exchange: %w", err)
 	}
 
+	// The initial code exchange must yield an ID token: it is the verified
+	// assertion of who just authenticated.
 	rawIDToken, ok := tok.Extra("id_token").(string)
 	if !ok || rawIDToken == "" {
-		return "", nil, ErrNoIDToken
+		return nil, nil, ErrNoIDToken
+	}
+	claims, err := st.verifyIDClaims(ctx, rawIDToken)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tokensFrom(tok), claims, nil
+}
+
+// ExchangeCode exchanges an authorization code for tokens using the PKCE
+// verifier, returning the access token (for session storage) and the verified
+// claims from the ID token.
+//
+// Deprecated: use [Client.Exchange], which additionally returns the refresh
+// token needed to renew the session via [Client.Refresh] and the access-token
+// expiry. ExchangeCode discards both.
+func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (accessToken string, claims *Claims, err error) {
+	toks, cl, err := c.Exchange(ctx, code, verifier)
+	if err != nil {
+		return "", nil, err
+	}
+	return toks.AccessToken, cl, nil
+}
+
+// Refresh renews a session using a refresh token obtained from [Client.Exchange]
+// (which requires [Config.OfflineAccess]). It POSTs grant_type=refresh_token to
+// the provider's token endpoint and returns the new [Tokens] and verified
+// claims.
+//
+// On an IdP that rotates refresh tokens -- as webauth does -- the returned
+// Tokens.RefreshToken is a NEW token: persist it and discard the one passed in.
+// The caller is responsible for storing the rotated token (oidclient keeps no
+// session state); failing to do so ends the session on the next refresh.
+//
+// Returns [ErrNoRefreshToken] for an empty token and [ErrNotReady] while a lazy
+// client's discovery is pending.
+func (c *Client) Refresh(ctx context.Context, refreshToken string) (*Tokens, *Claims, error) {
+	st := c.state.Load()
+	if st == nil {
+		return nil, nil, ErrNotReady
+	}
+	if refreshToken == "" {
+		return nil, nil, ErrNoRefreshToken
+	}
+	if c.cfg.HTTPClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, c.cfg.HTTPClient)
 	}
 
+	// A token with only a refresh token is invalid, so TokenSource performs the
+	// refresh grant. oauth2 carries the rotated refresh token through on the
+	// result, falling back to the supplied one only when the response omits it.
+	tok, err := st.oauth2Cfg.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
+	if err != nil {
+		return nil, nil, fmt.Errorf("refresh token: %w", err)
+	}
+
+	// A refresh response MAY omit the ID token (OIDC Core 12.2). Prefer the
+	// fresh ID token when present; otherwise fall back to the access token,
+	// which webauth issues as a verifiable JWT.
+	var claims *Claims
+	if raw, ok := tok.Extra("id_token").(string); ok && raw != "" {
+		claims, err = st.verifyIDClaims(ctx, raw)
+	} else {
+		claims, err = c.Validate(ctx, tok.AccessToken)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return tokensFrom(tok), claims, nil
+}
+
+// tokensFrom projects an oauth2 token onto the public [Tokens] view.
+func tokensFrom(tok *oauth2.Token) *Tokens {
+	return &Tokens{
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+		Expiry:       tok.Expiry,
+	}
+}
+
+// verifyIDClaims verifies a raw ID token against the audience-checked verifier
+// and extracts its claims, enforcing a non-empty sub.
+func (st *providerState) verifyIDClaims(ctx context.Context, rawIDToken string) (*Claims, error) {
 	idToken, err := st.idVerifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return "", nil, fmt.Errorf("verify ID token: %w", err)
+		return nil, fmt.Errorf("verify ID token: %w", err)
 	}
-
 	var cl Claims
 	if err := idToken.Claims(&cl); err != nil {
-		return "", nil, fmt.Errorf("extract claims: %w", err)
+		return nil, fmt.Errorf("extract claims: %w", err)
 	}
 	if cl.Sub == "" {
-		return "", nil, ErrMissingSub
+		return nil, ErrMissingSub
 	}
-
-	return tok.AccessToken, &cl, nil
+	return &cl, nil
 }
 
 // ValidateCookie extracts the JWT from the session cookie and validates it.
