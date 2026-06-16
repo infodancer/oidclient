@@ -153,6 +153,7 @@ type providerState struct {
 	idVerifier     *oidc.IDTokenVerifier // audience = ClientID (for ID tokens at callback)
 	accessVerifier *oidc.IDTokenVerifier // skip audience check (for access tokens per-request)
 	clientID       string                // server-assigned by dynamic registration, else Config.ClientID
+	endSessionURL  string                // discovered end_session_endpoint (RP-initiated logout); "" if unadvertised
 }
 
 // Lazy retry backoff bounds; see retryConnect.
@@ -238,6 +239,15 @@ func (c *Client) connect(ctx context.Context) (*providerState, error) {
 		return nil, fmt.Errorf("oidclient: discovery failed: %w", err)
 	}
 
+	// Pull the RP-initiated-logout endpoint from discovery. Optional: many
+	// providers don't advertise it, in which case LogoutURL falls back to the
+	// legacy WebauthURL/logout path. Claims only errors if the doc is
+	// unparseable, which NewProvider already would have rejected.
+	var logoutMeta struct {
+		EndSessionEndpoint string `json:"end_session_endpoint"`
+	}
+	_ = provider.Claims(&logoutMeta)
+
 	// Auto-register via RFC 7591 if the provider advertises a registration
 	// endpoint and the caller supplied a CallbackURL. The server-assigned
 	// client_id (and client_secret, if any) supersedes Config.ClientID for
@@ -301,6 +311,7 @@ func (c *Client) connect(ctx context.Context) (*providerState, error) {
 		idVerifier:     idVerifier,
 		accessVerifier: accessVerifier,
 		clientID:       clientID,
+		endSessionURL:  logoutMeta.EndSessionEndpoint,
 	}, nil
 }
 
@@ -562,7 +573,15 @@ func (c *Client) LoginURL(redirectPath string) string {
 	return u.String()
 }
 
-// LogoutURL returns the IdP logout URL.
+// LogoutURL returns the IdP logout URL. When the provider advertises an
+// end_session_endpoint (OIDC RP-Initiated Logout), that discovered, fully
+// qualified URL is returned -- it is issuer/tenant-scoped and actually exists.
+// Only when no such endpoint is advertised (or discovery has not completed) does
+// this fall back to the legacy WebauthURL/logout path, which historically was a
+// fabricated guess and may 404 on providers that do not serve it.
 func (c *Client) LogoutURL() string {
+	if st := c.state.Load(); st != nil && st.endSessionURL != "" {
+		return st.endSessionURL
+	}
 	return c.cfg.WebauthURL + "/logout"
 }

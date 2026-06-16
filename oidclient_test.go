@@ -59,6 +59,7 @@ func fakeProviderMux(t *testing.T) (mux *http.ServeMux, setBase func(string), is
 			"authorization_endpoint":                base + "/authorize",
 			"token_endpoint":                        base + "/token",
 			"jwks_uri":                              base + "/jwks",
+			"end_session_endpoint":                  base + "/end_session",
 			"response_types_supported":              []string{"code"},
 			"subject_types_supported":               []string{"public"},
 			"id_token_signing_alg_values_supported": []string{"RS256"},
@@ -423,9 +424,8 @@ func TestLoginURL(t *testing.T) {
 	if got := c.LoginURL("/dashboard"); !strings.Contains(got, "redirect_uri") {
 		t.Errorf("LoginURL(/dashboard) = %q, expected redirect_uri param", got)
 	}
-	if got := c.LogoutURL(); !strings.Contains(got, "/logout") {
-		t.Errorf("LogoutURL() = %q", got)
-	}
+	// LogoutURL is covered by TestLogoutURL_UsesDiscoveredEndSession and
+	// TestLogoutURL_FallsBackWhenUnadvertised.
 }
 
 // registrationRecord captures what the fake registration endpoint received
@@ -830,5 +830,59 @@ func TestExchangeCode_PublicClientSendsNoSecret(t *testing.T) {
 	}
 	if *gotSecret != "" {
 		t.Errorf("public client sent client_secret %q, want empty", *gotSecret)
+	}
+}
+
+func TestLogoutURL_UsesDiscoveredEndSession(t *testing.T) {
+	srv, issuer, _ := fakeProvider(t)
+	c := newTestClient(t, srv, issuer)
+
+	want := issuer + "/end_session"
+	if got := c.LogoutURL(); got != want {
+		t.Errorf("LogoutURL() = %q, want the discovered end_session_endpoint %q", got, want)
+	}
+}
+
+func TestLogoutURL_FallsBackWhenUnadvertised(t *testing.T) {
+	// A minimal provider whose discovery document omits end_session_endpoint.
+	priv, pub := testKeyPair(t)
+	kid := "test-kid"
+	var base string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                                base,
+			"authorization_endpoint":                base + "/authorize",
+			"token_endpoint":                        base + "/token",
+			"jwks_uri":                              base + "/jwks",
+			"response_types_supported":              []string{"code"},
+			"subject_types_supported":               []string{"public"},
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+		})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]any{{
+			"kty": "RSA", "kid": kid, "alg": "RS256", "use": "sig",
+			"n": base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
+		}}})
+	})
+	_ = priv
+	srv := httptest.NewServer(mux)
+	base = srv.URL
+	t.Cleanup(srv.Close)
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:  srv.URL,
+		CookieName: "test_jwt",
+		WebauthURL: "https://auth.example.com",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// No end_session_endpoint advertised -> legacy WebauthURL/logout fallback.
+	if got, want := c.LogoutURL(), "https://auth.example.com/logout"; got != want {
+		t.Errorf("LogoutURL() = %q, want legacy fallback %q", got, want)
 	}
 }
