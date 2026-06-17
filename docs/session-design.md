@@ -97,10 +97,15 @@ plaintext token. The app's token columns hold opaque bytes.
   nonce per encryption; the stored blob is `keyID || nonce || ciphertext||tag`.
 - **AAD**: the session id, so a ciphertext cannot be transplanted into another
   row.
-- **Keyring**: the app supplies a keyring keyed by a short key id. The active key
-  encrypts; any key in the ring can decrypt. A `keyID` prefix on each blob lets a
-  key roll forward -- new writes use the new key, old rows decrypt under the old
-  one and re-encrypt on their next rotation. No big-bang re-encryption.
+- **Keyring**: a small `Keyring` type with explicit `Add(id, key)` and
+  `SetActive(id)`, so the app states which key encrypts and which remain
+  available to decrypt. The active key encrypts; any key in the ring can decrypt.
+  A `keyID` prefix on each blob lets a key roll forward -- new writes use the new
+  key, old rows decrypt under the old one and re-encrypt on their next rotation.
+  No big-bang re-encryption.
+- **What gets encrypted**: both the refresh token and the access token. The
+  access token is a short-lived signed JWT and less sensitive, but encrypting it
+  under the same envelope costs nothing and keeps the columns uniform.
 - **Key source**: the app loads the key(s) from its own secret store and passes
   them in config. The key never touches the database. The package does not read
   env vars or files.
@@ -173,7 +178,7 @@ type Config struct {
     Renewer     Renewer
     Keyring     *Keyring      // token-at-rest encryption; required
     CookieName  string        // session-id cookie name
-    AbsoluteTTL time.Duration // hard session lifetime; must stay under the IdP refresh-token TTL
+    AbsoluteTTL time.Duration // hard session lifetime; default 30d; must stay under the IdP refresh-token TTL
     RefreshSkew time.Duration // renew this long before access-token expiry (default 60s)
 }
 
@@ -273,15 +278,15 @@ test deployment can supply a throwaway key explicitly.
 - In each app: a thin `Store` adapter test against its real driver, plus the
   existing higher-level auth tests.
 
-## Open questions
+## Decisions
 
-1. **Keyring shape** -- a `map[string][]byte` keyed by id with a designated
-   active id, or a small `Keyring` type with `Add`/`SetActive`? Leaning to the
-   latter so rotation is explicit.
-2. **Encrypt the access token too?** It is a short-lived (24h) signed JWT, far
-   less sensitive than the refresh token. Encrypting both with the same envelope
-   costs nothing extra and keeps the columns uniform; proposed default is to
-   encrypt both.
-3. **AbsoluteTTL default** -- herald uses 30d, sf 6d. Make it a required config
-   value (no default) so each app states its own, bounded under the IdP's
-   refresh TTL.
+1. **Keyring shape** -- a small `Keyring` type with explicit `Add(id, key)` and
+   `SetActive(id)`, so key rotation is an explicit operation rather than a
+   convention over a bare map.
+2. **Encrypt the access token too** -- yes. Both token columns are encrypted
+   under the same envelope; the access token being short-lived does not justify a
+   split storage path.
+3. **AbsoluteTTL default** -- 30d, overridable. There is no data-handling
+   requirement driving a short idle timeout, so the default favors not logging
+   active users out weekly; an app with stricter needs sets its own, bounded
+   under the IdP refresh-token TTL.
