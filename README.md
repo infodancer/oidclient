@@ -172,6 +172,30 @@ oidclient.SetSessionCookie(w, client.CookieName(), newTokens.AccessToken, secure
 Renew proactively rather than waiting for a 401: `Claims.ExpiresAt()` exposes
 the access-token expiry, so a caller can refresh a minute ahead of time.
 
+### Managed sessions
+
+The `oidclient/session` subpackage wraps the renewal primitives above into a
+full server-side session lifecycle so relying parties don't hand-roll it: the
+browser holds an opaque session id, the access and rotating refresh tokens live
+server-side (encrypted at rest), and the manager validates and renews on each
+request -- collapsing concurrent renewals and guarding the refresh-token replay
+race. It persists nothing itself; the host supplies a `session.Store` over its
+own database and a `session.Keyring` for the at-rest encryption.
+
+```go
+mgr, err := session.New(session.Config{
+    Store:      myStore,   // implemented over the host DB
+    Renewer:    client,    // the *oidclient.Client
+    Keyring:    keyring,   // AES-256-GCM keys from the host's secret store
+    CookieName: client.CookieName(),
+})
+// callback:       mgr.Start(w, r, tokens, claims)
+// every request:  claims, err := mgr.Authenticate(r)  // renews transparently
+// logout:         mgr.Destroy(w, r)
+```
+
+Design and rationale: [docs/session-design.md](docs/session-design.md).
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). Vulnerability reporting in
