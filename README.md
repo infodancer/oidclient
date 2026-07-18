@@ -196,6 +196,30 @@ mgr, err := session.New(session.Config{
 
 Design and rationale: [docs/session-design.md](docs/session-design.md).
 
+### Provisioning local users
+
+The `oidclient/rpuser` subpackage is the audited claims -> local-user path, so
+relying parties don't each re-implement the post-login sync policy: users are
+keyed strictly on (issuer, subject) and never matched by email, mutable claims
+(email, email_verified) sync at login only, and the per-request path is
+read-only. The host keeps its schema and SQL, implementing `rpuser.UserStore`
+over its own users table; the package owns the flow.
+
+```go
+store := myUserStore{}  // implements rpuser.UserStore over the host DB
+prov := &rpuser.Provisioner{Store: store, Issuer: cfg.IssuerURL}
+mw := &rpuser.Middleware{Authenticator: mgr, Store: store, Issuer: cfg.IssuerURL}
+
+// callback, after Exchange:  u, isNew, err := prov.Provision(ctx, claims)
+// route setup:               handler = mw.Optional(mux)
+// in handlers:               rpuser.UserFromContext(ctx), rpuser.IdentityFromContext(ctx)
+```
+
+`rpuser.Identity` mirrors `authz.Identity` and carries no roles: authorization
+is resolved by the host's grant store (see
+[infodancer/authz](https://github.com/infodancer/authz)), never from claims.
+Rationale: [issue #10](https://github.com/infodancer/oidclient/issues/10).
+
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). Vulnerability reporting in
