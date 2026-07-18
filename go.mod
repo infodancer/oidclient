@@ -1,6 +1,6 @@
 module github.com/infodancer/oidclient
 
-go 1.25.11
+go 1.25.12
 
 require (
 	github.com/coreos/go-oidc/v3 v3.18.0
