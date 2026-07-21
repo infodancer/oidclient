@@ -2,7 +2,10 @@ package session
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -106,6 +109,61 @@ func TestKeyring_AddRejectsBadKey(t *testing.T) {
 	}
 	if err := kr.Add("", key(1)); err == nil {
 		t.Error("Add must reject an empty key id")
+	}
+}
+
+// TestNewKeyringFromBase64_FailOpen verifies the constructor never fails
+// over a key problem: a good key becomes the persistent "k1", while an
+// absent or invalid key degrades to an ephemeral key (still encrypting, just
+// not surviving a restart) rather than erroring. ActiveID reflects which
+// path was taken.
+func TestNewKeyringFromBase64_FailOpen(t *testing.T) {
+	good := make([]byte, 32)
+	if _, err := rand.Read(good); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name       string
+		key        string
+		wantActive string
+	}{
+		{"valid key", base64.StdEncoding.EncodeToString(good), "k1"},
+		{"unset", "", "ephemeral"},
+		{"not base64", "@@@not-base64@@@", "ephemeral"},
+		{"wrong length", base64.StdEncoding.EncodeToString([]byte("too-short")), "ephemeral"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kr, err := NewKeyringFromBase64(tc.key, "TEST_SESSION_ENC_KEY", nil)
+			if err != nil {
+				t.Fatalf("NewKeyringFromBase64 must not error on a key problem, got: %v", err)
+			}
+			if kr.ActiveID() != tc.wantActive {
+				t.Errorf("active key id = %q, want %q", kr.ActiveID(), tc.wantActive)
+			}
+			blob, err := kr.Seal([]byte("token"), []byte("sid"))
+			if err != nil {
+				t.Fatalf("Seal: %v", err)
+			}
+			got, err := kr.Open(blob, []byte("sid"))
+			if err != nil || string(got) != "token" {
+				t.Errorf("round trip: got %q, %v", got, err)
+			}
+		})
+	}
+}
+
+// TestNewKeyringFromBase64_LogsWithEnvVarName verifies the warning message
+// names the caller's config source, not a hardcoded one -- the whole point
+// of taking envVarName as a parameter.
+func TestNewKeyringFromBase64_LogsWithEnvVarName(t *testing.T) {
+	var got string
+	logf := func(format string, args ...any) { got = fmt.Sprintf(format, args...) }
+	if _, err := NewKeyringFromBase64("", "MYAPP_SESSION_ENC_KEY", logf); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains([]byte(got), []byte("MYAPP_SESSION_ENC_KEY")) {
+		t.Errorf("warning = %q, want it to name MYAPP_SESSION_ENC_KEY", got)
 	}
 }
 

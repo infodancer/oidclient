@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"sync"
@@ -32,6 +33,41 @@ type Keyring struct {
 // NewKeyring returns an empty keyring. Add at least one key before use.
 func NewKeyring() *Keyring {
 	return &Keyring{keys: make(map[string]cipher.AEAD)}
+}
+
+// NewKeyringFromBase64 builds a Keyring from a base64-encoded 32-byte
+// AES-256 key. It fails open rather than erroring when encKeyB64 is empty or
+// unusable: the returned Keyring still has a working "ephemeral" key, so
+// sessions keep encrypting at rest, they just won't survive a process
+// restart. envVarName names the config source (e.g. "SESSION_ENC_KEY") in the
+// warning so an operator knows what to fix; logf receives that warning, or is
+// a no-op if nil. The only error return is a failure to generate the
+// ephemeral key itself (an unrecoverable rand.Read failure).
+func NewKeyringFromBase64(encKeyB64, envVarName string, logf func(format string, args ...any)) (*Keyring, error) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	kr := NewKeyring()
+	if encKeyB64 != "" {
+		if raw, err := base64.StdEncoding.DecodeString(encKeyB64); err != nil {
+			logf("WARNING: %s is not valid base64 (%v); using an ephemeral key -- sessions will not survive a restart. Fix the key in the host secret store.", envVarName, err)
+		} else if err := kr.Add("k1", raw); err != nil {
+			logf("WARNING: %s is unusable (%v); using an ephemeral key -- sessions will not survive a restart. Fix the key in the host secret store.", envVarName, err)
+		} else {
+			return kr, nil
+		}
+	} else {
+		logf("WARNING: %s is not set; using an ephemeral key. OIDC session tokens are still encrypted at rest, but sessions will not survive a restart. Set a persistent key in production.", envVarName)
+	}
+
+	eph := make([]byte, 32)
+	if _, err := rand.Read(eph); err != nil {
+		return nil, fmt.Errorf("oidclient/session: generate ephemeral session key: %w", err)
+	}
+	if err := kr.Add("ephemeral", eph); err != nil {
+		return nil, fmt.Errorf("oidclient/session: ephemeral session key: %w", err)
+	}
+	return kr, nil
 }
 
 // Add registers a 32-byte (AES-256) key under id. The id is stamped into every
