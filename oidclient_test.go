@@ -751,7 +751,7 @@ func confidentialProvider(t *testing.T, clientID string) (issuer string, gotSecr
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(doc) //nolint:errcheck
+		json.NewEncoder(w).Encode(doc)
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
 		doc := map[string]any{"keys": []map[string]any{{
@@ -760,7 +760,7 @@ func confidentialProvider(t *testing.T, clientID string) (issuer string, gotSecr
 			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
 		}}}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(doc) //nolint:errcheck
+		json.NewEncoder(w).Encode(doc)
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
@@ -775,7 +775,7 @@ func confidentialProvider(t *testing.T, clientID string) (issuer string, gotSecr
 		access := mk(jwtgo.MapClaims{"iss": baseURL, "sub": "g-1", "email": "user@gmail.com", "iat": now.Unix(), "exp": now.Add(time.Hour).Unix()})
 		id := mk(jwtgo.MapClaims{"iss": baseURL, "sub": "g-1", "aud": clientID, "email": "user@gmail.com", "email_verified": true, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix()})
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]any{
 			"access_token": access, "id_token": id, "token_type": "Bearer", "expires_in": 3600,
 		})
 	})

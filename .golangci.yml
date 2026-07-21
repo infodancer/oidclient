@@ -6,7 +6,15 @@ run:
 
 linters:
   default: standard
+  enable:
+    - dupl
+    - nolintlint
   settings:
+    dupl:
+      threshold: 150 # tokens; golangci-lint default
+    nolintlint:
+      require-explanation: true # a bare //nolint:x with no reason is as bad as no comment
+      require-specific: true # forbid bare //nolint; must name the linter(s)
     errcheck:
       # Functions whose error returns we deliberately ignore project-
       # wide. Best-effort cleanup or stdout/stderr writes where there
