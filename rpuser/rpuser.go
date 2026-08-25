@@ -138,8 +138,17 @@ func (p *Provisioner) Provision(ctx context.Context, claims *oidclient.Claims) (
 	if claims == nil {
 		return User{}, false, errors.New("oidclient/rpuser: nil claims")
 	}
-	id := FromClaims(p.Issuer, claims)
+	return p.ProvisionIdentity(ctx, FromClaims(p.Issuer, claims))
+}
 
+// ProvisionIdentity is [Provisioner.Provision] over an already-normalized
+// identity. It exists so the resource-server path -- which has an
+// [oidclient.AccessToken] rather than claims -- runs the identical policy
+// instead of a second copy of it. See accesstoken.go.
+//
+// id must be fully normalized, with the display-name fallback already applied;
+// [FromClaims] and [FromAccessToken] both do that.
+func (p *Provisioner) ProvisionIdentity(ctx context.Context, id Identity) (User, bool, error) {
 	u, err := p.Store.LookupBySubject(ctx, id.Issuer, id.Subject)
 	switch {
 	case err == nil:
