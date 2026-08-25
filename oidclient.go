@@ -1,6 +1,18 @@
-// Package oidclient is an OIDC relying party library for web applications
-// authenticating against an OpenID Connect provider (designed for use with
-// infodancer/webauth but compatible with any spec-compliant IdP).
+// Package oidclient is a client library for services consuming an OpenID
+// Connect provider (designed for use with infodancer/webauth but compatible
+// with any spec-compliant IdP). It supports the two ways a service consumes
+// one:
+//
+//   - As a relying party: [Client] runs the authorization code flow with PKCE,
+//     manages the session cookie, and validates its own tokens. This is what a
+//     website uses to sign users in.
+//   - As a resource server: [ResourceServer] validates access tokens it did not
+//     obtain, checking that each was issued for this resource. This is what an
+//     API uses to authenticate a caller who arrives holding a bearer token.
+//
+// The distinction matters beyond naming -- a resource server must verify the
+// audience and must never register itself as a client, and the relying party
+// does the opposite of both. See the commentary on [ResourceServer].
 //
 // It wraps [github.com/coreos/go-oidc/v3] for discovery, JWKS, and token
 // verification, and [golang.org/x/oauth2] for the authorization code flow
