@@ -95,6 +95,11 @@ type AccessToken struct {
 	Email string
 	Name  string
 
+	// EmailVerified is the provider's assertion that the subject controls
+	// Email. Carried so a provisioning policy can record it; it is never a
+	// reason to match an account by email.
+	EmailVerified bool
+
 	// Scopes is the scope claim, already split on whitespace. What a scope
 	// permits is the caller's decision; this reports only what was granted.
 	Scopes []string
@@ -170,10 +175,11 @@ func NewResourceServer(ctx context.Context, cfg ResourceServerConfig) (*Resource
 // rsClaims is the wire shape for the claims this package surfaces beyond the
 // registered ones go-oidc already parses.
 type rsClaims struct {
-	Email string   `json:"email,omitempty"`
-	Name  string   `json:"name,omitempty"`
-	Scope string   `json:"scope,omitempty"`
-	Roles []string `json:"roles,omitempty"`
+	Email         string   `json:"email,omitempty"`
+	EmailVerified bool     `json:"email_verified,omitempty"`
+	Name          string   `json:"name,omitempty"`
+	Scope         string   `json:"scope,omitempty"`
+	Roles         []string `json:"roles,omitempty"`
 }
 
 // Verify checks token and returns what it asserts.
@@ -210,12 +216,13 @@ func (rs *ResourceServer) Verify(ctx context.Context, token string) (*AccessToke
 	}
 
 	return &AccessToken{
-		Subject: idToken.Subject,
-		Email:   c.Email,
-		Name:    c.Name,
-		Scopes:  strings.Fields(c.Scope),
-		Roles:   c.Roles,
-		Expiry:  idToken.Expiry,
+		Subject:       idToken.Subject,
+		Email:         c.Email,
+		EmailVerified: c.EmailVerified,
+		Name:          c.Name,
+		Scopes:        strings.Fields(c.Scope),
+		Roles:         c.Roles,
+		Expiry:        idToken.Expiry,
 	}, nil
 }
 
