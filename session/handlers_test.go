@@ -310,8 +310,8 @@ func TestCallback_ExchangeFailureIsAGenericBadGateway(t *testing.T) {
 func TestCallback_OnAuthenticatedGatesTheLogin(t *testing.T) {
 	p := okProvider()
 	h, store := newHandlers(t, p, func(c *HandlerConfig) {
-		c.OnAuthenticated = func(*http.Request, *oidclient.Claims) (string, error) {
-			return "", errors.New("account disabled")
+		c.OnAuthenticated = func(*http.Request, *oidclient.Claims) (Login, error) {
+			return Login{}, errors.New("account disabled")
 		}
 	})
 	rec := httptest.NewRecorder()
@@ -330,9 +330,9 @@ func TestCallback_OnAuthenticatedGatesTheLogin(t *testing.T) {
 func TestCallback_OnAuthenticatedSeesTheClaimsAndPicksTheDefaultRedirect(t *testing.T) {
 	var got string
 	h, _ := newHandlers(t, okProvider(), func(c *HandlerConfig) {
-		c.OnAuthenticated = func(_ *http.Request, cl *oidclient.Claims) (string, error) {
+		c.OnAuthenticated = func(_ *http.Request, cl *oidclient.Claims) (Login, error) {
 			got = cl.Sub
-			return "/welcome", nil
+			return Login{DefaultRedirect: "/welcome"}, nil
 		}
 	})
 	rec := httptest.NewRecorder()
@@ -405,5 +405,107 @@ func TestLogoutRedirectMustBeLocal(t *testing.T) {
 	m := newManager(t, newMemStore(), &fakeRenewer{}, testKeyring(t))
 	if _, err := NewHandlers(HandlerConfig{Provider: okProvider(), Sessions: m, LogoutRedirect: "https://evil.example/"}); err == nil {
 		t.Error("accepted an off-site LogoutRedirect")
+	}
+}
+
+// --- Finish --------------------------------------------------------------------
+
+// Finish replaces the default redirect, for sites that finish a login in their
+// own way (a popup that closes itself, an extra cookie). It runs after the
+// session has started, and Data from the hook reaches it.
+func TestCallback_FinishReplacesTheRedirect(t *testing.T) {
+	var gotRedirect string
+	var gotData any
+	var rowsAtFinish int
+	var h *Handlers
+	var store *memStore
+	h, store = newHandlers(t, okProvider(), func(c *HandlerConfig) {
+		c.OnAuthenticated = func(*http.Request, *oidclient.Claims) (Login, error) {
+			return Login{DefaultRedirect: "/welcome", Data: "new-account"}, nil
+		}
+		c.Finish = func(w http.ResponseWriter, r *http.Request, redirectTo string, l Login) {
+			gotRedirect, gotData = redirectTo, l.Data
+			rowsAtFinish = len(store.rows)
+			http.SetCookie(w, &http.Cookie{Name: "extra", Value: "1", Path: "/"})
+			w.WriteHeader(http.StatusTeapot)
+		}
+	})
+	_ = h
+	rec := httptest.NewRecorder()
+	h.Callback().ServeHTTP(rec, cbReq("code=c&state=st-1", flowCookies("/account")))
+
+	if rec.Code != http.StatusTeapot || rec.Header().Get("Location") != "" {
+		t.Errorf("status %d, Location %q: Finish should have produced the response", rec.Code, rec.Header().Get("Location"))
+	}
+	if gotRedirect != "/account" {
+		t.Errorf("Finish got redirectTo %q, want the explicit /account", gotRedirect)
+	}
+	if gotData != "new-account" {
+		t.Errorf("Finish got Data %v, want what the hook returned", gotData)
+	}
+	if rowsAtFinish != 1 {
+		t.Errorf("%d sessions existed when Finish ran, want it to run after the session started", rowsAtFinish)
+	}
+	if cookieNamed(rec, "sid") == nil || cookieNamed(rec, "extra") == nil {
+		t.Error("the session cookie and Finish's own cookie should both be on the response")
+	}
+	if c := cookieNamed(rec, oidclient.CookieState); c == nil || c.MaxAge >= 0 {
+		t.Error("flow cookies were not cleared before Finish")
+	}
+}
+
+// What Finish receives is already sanitized: it can use the target directly.
+func TestCallback_FinishGetsASanitizedTarget(t *testing.T) {
+	var got string
+	h, _ := newHandlers(t, okProvider(), func(c *HandlerConfig) {
+		c.OnAuthenticated = func(*http.Request, *oidclient.Claims) (Login, error) {
+			return Login{DefaultRedirect: "https://evil.example/"}, nil
+		}
+		c.Finish = func(w http.ResponseWriter, _ *http.Request, redirectTo string, _ Login) {
+			got = redirectTo
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+	rec := httptest.NewRecorder()
+	h.Callback().ServeHTTP(rec, cbReq("code=c&state=st-1", flowCookies("//evil.example/x")))
+	if got != "/" {
+		t.Errorf("Finish got %q, want an off-site cookie value and an off-site default both replaced by /", got)
+	}
+}
+
+// Finish is the success path only.
+func TestCallback_FinishNeverRunsOnAFailedLogin(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		ck    map[string]string
+		mod   func(*fakeProvider, *HandlerConfig)
+	}{
+		{"state mismatch", "code=c&state=other", flowCookies(""), nil},
+		{"upstream error", "error=access_denied&state=st-1", flowCookies(""), nil},
+		{"exchange fails", "code=c&state=st-1", flowCookies(""), func(p *fakeProvider, _ *HandlerConfig) {
+			p.exchange = func(string, string) (*oidclient.Tokens, *oidclient.Claims, error) {
+				return nil, nil, errors.New("nope")
+			}
+		}},
+		{"hook refuses", "code=c&state=st-1", flowCookies(""), func(_ *fakeProvider, c *HandlerConfig) {
+			c.OnAuthenticated = func(*http.Request, *oidclient.Claims) (Login, error) { return Login{}, errors.New("no") }
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := okProvider()
+			called := false
+			h, _ := newHandlers(t, p, func(c *HandlerConfig) {
+				c.Finish = func(http.ResponseWriter, *http.Request, string, Login) { called = true }
+				if tc.mod != nil {
+					tc.mod(p, c)
+				}
+			})
+			h.Callback().ServeHTTP(httptest.NewRecorder(), cbReq(tc.query, tc.ck))
+			if called {
+				t.Error("Finish ran for a login that did not complete")
+			}
+		})
 	}
 }

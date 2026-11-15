@@ -22,6 +22,18 @@ type Provider interface {
 
 var _ Provider = (*oidclient.Client)(nil)
 
+// Login is what OnAuthenticated hands back, and what Finish receives.
+type Login struct {
+	// DefaultRedirect is the post-login destination used only when the flow
+	// carried no explicit return target of its own. It must be a local path;
+	// anything else is ignored.
+	DefaultRedirect string
+	// Data is opaque to this package and reaches Finish unchanged. It is how a
+	// fact the hook learned (the account is new) gets to the code that
+	// completes the response.
+	Data any
+}
+
 // HandlerConfig builds the login handlers. Provider and Sessions are required.
 type HandlerConfig struct {
 	Provider Provider
@@ -29,10 +41,16 @@ type HandlerConfig struct {
 
 	// OnAuthenticated runs after a successful code exchange and before the
 	// session starts: the place to provision or sync a local user from the
-	// claims. An error aborts the login (no session, a generic 500). The
-	// returned redirect, when it is a local path, is the destination used
-	// only if the flow carried no explicit return target of its own.
-	OnAuthenticated func(r *http.Request, claims *oidclient.Claims) (defaultRedirect string, err error)
+	// claims. An error aborts the login (no session, a generic 500).
+	OnAuthenticated func(r *http.Request, claims *oidclient.Claims) (Login, error)
+
+	// Finish, when set, completes the response after the session cookie is
+	// written and the flow cookies are cleared, replacing the default 302. Use
+	// it for a login that ends differently: a popup that posts a message to
+	// its opener and closes, or an extra cookie. redirectTo is the final,
+	// already-sanitized local destination. Finish only runs for a login that
+	// succeeded.
+	Finish func(w http.ResponseWriter, r *http.Request, redirectTo string, login Login)
 
 	// LogoutRedirect is where Logout sends the browser; it must be a local
 	// path. Empty means "/".
@@ -147,9 +165,9 @@ func (h *Handlers) Callback() http.Handler {
 			return
 		}
 
-		fallback := ""
+		var login Login
 		if h.cfg.OnAuthenticated != nil {
-			fallback, err = h.cfg.OnAuthenticated(r, claims)
+			login, err = h.cfg.OnAuthenticated(r, claims)
 			if err != nil {
 				h.cfg.Logf("oidclient/session: OnAuthenticated: %v", err)
 				http.Error(w, "internal error", http.StatusInternalServerError)
@@ -164,12 +182,16 @@ func (h *Handlers) Callback() http.Handler {
 
 		redirectTo := oidclient.LocalPath(oidclient.FlowCookieValue(r, oidclient.CookieRedirect))
 		if redirectTo == "" {
-			redirectTo = oidclient.LocalPath(fallback)
+			redirectTo = oidclient.LocalPath(login.DefaultRedirect)
 		}
 		if redirectTo == "" {
 			redirectTo = "/"
 		}
 		oidclient.ClearFlowCookies(w)
+		if h.cfg.Finish != nil {
+			h.cfg.Finish(w, r, redirectTo, login)
+			return
+		}
 		http.Redirect(w, r, redirectTo, http.StatusFound)
 	})
 }
