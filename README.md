@@ -196,6 +196,37 @@ mgr, err := session.New(session.Config{
 
 Design and rationale: [docs/session-design.md](docs/session-design.md).
 
+#### Login handlers
+
+`session.NewHandlers` supplies the login endpoints that go with a managed
+session, so a site does not write the callback by hand:
+
+```go
+h, err := session.NewHandlers(session.HandlerConfig{
+    Provider: client,   // the *oidclient.Client
+    Sessions: mgr,
+    OnAuthenticated: func(r *http.Request, c *oidclient.Claims) (string, error) {
+        return "", provisionUser(r.Context(), c) // optional; an error aborts the login
+    },
+})
+mux.Handle("GET /login", h.Login())
+mux.Handle("GET /auth/callback", h.Callback())
+mux.Handle("POST /logout", h.Logout())
+```
+
+`Login` (and `Register`, which lands on the IdP's registration page) reuse a flow
+already in progress, so two tabs do not invalidate each other. `Callback`
+rejects an upstream error, a missing code or state, a state that does not match
+the flow cookie (compared in constant time) and a missing verifier, all before
+the code is exchanged; then it exchanges with PKCE, runs `OnAuthenticated`,
+starts the session and clears the flow cookies. Failure responses are generic;
+the detail goes to `Logf`. The post-login redirect is reduced to a local path
+(`oidclient.LocalPath`) both when `Login` stores it and when `Callback` reads it
+back, since the cookie can be planted from a sibling subdomain.
+
+`Logout` accepts POST only, because a state-changing GET can be triggered by any
+page the user visits. Render sign-out as a form.
+
 ### Provisioning local users
 
 The `oidclient/rpuser` subpackage is the audited claims -> local-user path, so
