@@ -205,8 +205,14 @@ session, so a site does not write the callback by hand:
 h, err := session.NewHandlers(session.HandlerConfig{
     Provider: client,   // the *oidclient.Client
     Sessions: mgr,
-    OnAuthenticated: func(r *http.Request, c *oidclient.Claims) (string, error) {
-        return "", provisionUser(r.Context(), c) // optional; an error aborts the login
+    OnAuthenticated: func(r *http.Request, c *oidclient.Claims) (session.Login, error) {
+        isNew, err := provisionUser(r.Context(), c) // optional; an error aborts the login
+        return session.Login{Data: isNew}, err
+    },
+    // Optional: complete the response yourself (a popup that closes, an extra
+    // cookie) instead of the default 302. Login.Data from the hook arrives here.
+    Finish: func(w http.ResponseWriter, r *http.Request, redirectTo string, l session.Login) {
+        http.Redirect(w, r, redirectTo, http.StatusFound)
     },
 })
 mux.Handle("GET /login", h.Login())
@@ -219,7 +225,8 @@ already in progress, so two tabs do not invalidate each other. `Callback`
 rejects an upstream error, a missing code or state, a state that does not match
 the flow cookie (compared in constant time) and a missing verifier, all before
 the code is exchanged; then it exchanges with PKCE, runs `OnAuthenticated`,
-starts the session and clears the flow cookies. Failure responses are generic;
+starts the session and clears the flow cookies, then redirects or, when `Finish`
+is set, hands the response to it with the sanitized target and the hook's `Data`. Failure responses are generic;
 the detail goes to `Logf`. The post-login redirect is reduced to a local path
 (`oidclient.LocalPath`) both when `Login` stores it and when `Callback` reads it
 back, since the cookie can be planted from a sibling subdomain.
