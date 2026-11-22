@@ -36,6 +36,12 @@ const (
 // should be logged.
 var ErrNoSession = errors.New("oidclient/session: no session")
 
+// ErrSubjectChanged is returned when a renewal answers for a subject other
+// than the one the session was started for. It is a fault at the provider, or
+// a Store that does not persist Session.UserSub; either way the session cannot
+// be trusted and is not renewed.
+var ErrSubjectChanged = errors.New("oidclient/session: renewal answered for a different subject")
+
 // ErrNotFound is what a Store.Get returns when no row matches the id. The
 // Manager maps it to ErrNoSession.
 var ErrNotFound = errors.New("oidclient/session: not found")
@@ -46,7 +52,7 @@ var ErrNotFound = errors.New("oidclient/session: not found")
 // tokens.
 type Session struct {
 	ID             string // opaque session id; the cookie value
-	UserSub        string // claims.Sub, for the host's user lookup
+	UserSub        string // claims.Sub; a Store must persist it -- every token is checked against it
 	AccessToken    []byte // AES-GCM ciphertext
 	RefreshToken   []byte // AES-GCM ciphertext
 	Version        int64  // compare-and-swap guard for rotation
@@ -111,6 +117,9 @@ type Manager struct {
 	// refresh-token grant. webauth rotates the refresh token on every use with
 	// replay detection, so two parallel requests must never both spend it.
 	group singleflight.Group
+
+	// rechecks bounds how often Recheck may spend a grant per session.
+	rechecks recheckLog
 }
 
 // New validates cfg and constructs a Manager.
@@ -186,21 +195,9 @@ func (m *Manager) Start(w http.ResponseWriter, r *http.Request, tokens *oidclien
 // renewing the access token when it is absent or near expiry. It returns
 // ErrNoSession when there is no usable session.
 func (m *Manager) Authenticate(r *http.Request) (*oidclient.Claims, error) {
-	c, err := r.Cookie(m.cookie)
-	if err != nil || c.Value == "" {
-		return nil, ErrNoSession
-	}
-	sess, err := m.store.Get(r.Context(), c.Value)
-	if errors.Is(err, ErrNotFound) {
-		return nil, ErrNoSession
-	}
+	sess, err := m.load(r)
 	if err != nil {
 		return nil, err
-	}
-	// A session past its hard TTL is dead even if the tokens would still verify.
-	if time.Now().After(sess.AbsoluteExpiry) {
-		_ = m.store.Delete(r.Context(), sess.ID)
-		return nil, ErrNoSession
 	}
 
 	// Fast path: the stored access token is comfortably in-date -- decrypt and
@@ -208,14 +205,40 @@ func (m *Manager) Authenticate(r *http.Request) (*oidclient.Claims, error) {
 	if claims, ok := m.tryStoredAccessToken(r.Context(), sess); ok {
 		return claims, nil
 	}
-	return m.renew(sess)
+	return m.renew(sess, nil)
+}
+
+// load resolves the request's cookie to its live session row, or ErrNoSession.
+func (m *Manager) load(r *http.Request) (Session, error) {
+	c, err := r.Cookie(m.cookie)
+	if err != nil || c.Value == "" {
+		return Session{}, ErrNoSession
+	}
+	sess, err := m.store.Get(r.Context(), c.Value)
+	if errors.Is(err, ErrNotFound) {
+		return Session{}, ErrNoSession
+	}
+	if err != nil {
+		return Session{}, err
+	}
+	// A session past its hard TTL is dead even if the tokens would still verify.
+	if time.Now().After(sess.AbsoluteExpiry) {
+		_ = m.store.Delete(r.Context(), sess.ID)
+		return Session{}, ErrNoSession
+	}
+	return sess, nil
 }
 
 // renew performs (or joins) a single refresh-token grant for the session and
 // persists the rotated tokens. Concurrent callers for the same session id share
 // one grant via singleflight; the loser of a cross-instance race re-reads the
 // winner's tokens rather than spending its own stale refresh token.
-func (m *Manager) renew(sess Session) (*oidclient.Claims, error) {
+//
+// fresh, when non-nil, is an extra condition a stored token must meet to be
+// used instead of spending the refresh token: [Manager.Recheck] passes one so
+// that a token which is valid but too old is renewed anyway. Nil accepts any
+// valid stored token.
+func (m *Manager) renew(sess Session, fresh func(*oidclient.Claims) bool) (*oidclient.Claims, error) {
 	v, err, _ := m.group.Do(sess.ID, func() (any, error) {
 		// Detached, timeout-bounded context: a client disconnect must not cancel
 		// a refresh that other in-flight requests are waiting on.
@@ -231,7 +254,7 @@ func (m *Manager) renew(sess Session) (*oidclient.Claims, error) {
 		if err != nil {
 			return nil, err
 		}
-		if claims, ok := m.tryStoredAccessToken(ctx, cur); ok {
+		if claims, ok := m.tryStoredAccessToken(ctx, cur); ok && (fresh == nil || fresh(claims)) {
 			return claims, nil
 		}
 
@@ -242,6 +265,12 @@ func (m *Manager) renew(sess Session) (*oidclient.Claims, error) {
 		tokens, claims, err := m.renewer.Refresh(ctx, string(refresh))
 		if err != nil {
 			return nil, fmt.Errorf("oidclient/session: refresh: %w", err)
+		}
+		// A session belongs to the subject it was started for. Tokens that
+		// come back for anyone else are not persisted: storing them would hand
+		// this cookie to another user.
+		if claims.Sub != cur.UserSub {
+			return nil, ErrSubjectChanged
 		}
 		access, sealedRefresh, err := m.sealTokens(cur.ID, tokens)
 		if err != nil {
@@ -285,6 +314,10 @@ func (m *Manager) tryStoredAccessToken(ctx context.Context, sess Session) (*oidc
 	}
 	claims, err := m.renewer.Validate(ctx, string(at))
 	if err != nil {
+		return nil, false
+	}
+	// Valid, but for someone else: not this session's token.
+	if claims.Sub != sess.UserSub {
 		return nil, false
 	}
 	return claims, true

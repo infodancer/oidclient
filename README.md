@@ -239,8 +239,9 @@ page the user visits. Render sign-out as a form.
 The `oidclient/rpuser` subpackage is the audited claims -> local-user path, so
 relying parties don't each re-implement the post-login sync policy: users are
 keyed strictly on (issuer, subject) and never matched by email, mutable claims
-(email, email_verified) sync at login only, and the per-request path is
-read-only. The host keeps its schema and SQL, implementing `rpuser.UserStore`
+(email, email_verified) sync at login, and the per-request path is read-only
+except for promoting an unverified row once the provider says the address is
+verified. The host keeps its schema and SQL, implementing `rpuser.UserStore`
 over its own users table; the package owns the flow.
 
 ```go
@@ -252,6 +253,15 @@ mw := &rpuser.Middleware{Authenticator: mgr, Store: store, Issuer: cfg.IssuerURL
 // route setup:               handler = mw.Optional(mux)
 // in handlers:               rpuser.UserFromContext(ctx), rpuser.IdentityFromContext(ctx)
 ```
+
+Email verification happens at the provider after sign-up, so a row written at
+sign-in starts out unverified and the session's claims are as old as its access
+token. While a row is unverified the middleware asks the session manager for
+claims no older than `Middleware.UnverifiedRecheck` (default 5 minutes;
+negative disables) via `session.Manager.Recheck`, and promotes the row when they
+say verified and name the address. That is a backstop for the user who verifies in another browser.
+The main route is the host's: send the user back through sign-in when they
+finish verifying, which syncs immediately. Verified users are never rechecked.
 
 `rpuser.Identity` mirrors `authz.Identity` and carries no roles: authorization
 is resolved by the host's grant store (see
