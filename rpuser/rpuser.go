@@ -9,10 +9,16 @@
 //   - Users are keyed strictly on (issuer, subject). Accounts are never matched
 //     or merged by email: an upstream that recycles or reassigns an email must
 //     not grant access to an existing local account.
-//   - Mutable claims (email, email_verified) are synced at login only, on the
+//   - Mutable claims (email, email_verified) are synced at login, on the
 //     existing row; a known subject never gets a second row. The display name
 //     is set at creation and never overwritten -- hosts may let users edit it.
-//   - The per-request path ([Middleware]) is strictly read-only.
+//   - The per-request path ([Middleware]) is read-only, with one exception: a
+//     row stored as unverified is promoted when the provider says the address
+//     is verified, and the session of such a user asks the provider again
+//     every few minutes until it is. Verification normally lands just after
+//     sign-up, on a session that would otherwise carry the old answer until
+//     its next login. The exception is one-way and fires once per user;
+//     nothing between logins lowers the flag or touches a verified row.
 //   - Issuer comes from the host's client configuration, not a token claim:
 //     oidclient validates the token's iss against the configured issuer during
 //     verification, so the configured value is the authoritative string -- the

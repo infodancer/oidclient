@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/infodancer/oidclient"
 	"github.com/infodancer/oidclient/session"
@@ -18,10 +19,28 @@ type Authenticator interface {
 
 var _ Authenticator = (*session.Manager)(nil)
 
+// Rechecker is the optional second slice of *session.Manager: renew a
+// session's claims early, at most once per minInterval. The middleware uses it
+// only for a user whose stored row is unverified; an Authenticator that does
+// not implement it simply never rechecks.
+type Rechecker interface {
+	Recheck(r *http.Request, minInterval time.Duration) (*oidclient.Claims, error)
+}
+
+var _ Rechecker = (*session.Manager)(nil)
+
+// DefaultUnverifiedRecheck is how often an unverified user's session asks the
+// provider again when [Middleware.UnverifiedRecheck] is zero.
+const DefaultUnverifiedRecheck = 5 * time.Minute
+
 // Middleware is the per-request half of the policy: resolve the session to
-// claims, the claims to the host's user row (read-only), and stash identity,
-// user, and claims in the request context for downstream handlers -- including
-// the host's authz identity source.
+// claims, the claims to the host's user row, and stash identity, user, and
+// claims in the request context for downstream handlers -- including the
+// host's authz identity source.
+//
+// The lookup is read-only for a verified row. For an unverified row it does
+// one more thing, described on [Middleware.UnverifiedRecheck]: it promotes the
+// row once the provider says the address is verified.
 //
 // It is optional-auth by design: it never blocks a request. Anonymous, expired,
 // and failed resolutions all proceed without context values, and route-level
@@ -41,9 +60,33 @@ type Middleware struct {
 	// Issuer is the client's configured issuer URL, as in [Provisioner].
 	Issuer string
 
+	// UnverifiedRecheck is how often the session of a user whose stored row is
+	// unverified asks the provider for fresh claims. Zero means
+	// [DefaultUnverifiedRecheck]; negative turns the early recheck off.
+	//
+	// The problem it answers: email verification happens at the provider,
+	// usually minutes after sign-up and often in another browser, while the row
+	// was written at sign-in and the session's claims are as old as its access
+	// token. Left alone the user stays unverified here until they sign in
+	// again. So, for an unverified row only:
+	//
+	//   - if the session's claims do not say verified and the Authenticator is
+	//     a [Rechecker], it is asked for claims no older than this interval;
+	//   - if the claims then say verified, the row is promoted through
+	//     UserStore.SyncEmail -- the address from the claims together with the
+	//     flag, exactly what the next sign-in would have written -- and re-read.
+	//
+	// This is the backstop, not the main route: a host should send the user
+	// back through sign-in when they finish verifying, which syncs at once.
+	// Promotion is one-way and happens once per user; nothing here lowers the
+	// flag, changes a verified row, or creates one. A verified user costs
+	// nothing extra.
+	UnverifiedRecheck time.Duration
+
 	// Logf receives diagnostics for faults worth surfacing: a failed session
-	// resolution (other than the expected no-session case) and a live session
-	// whose subject has no user row. Nil disables logging.
+	// resolution (other than the expected no-session case), a live session
+	// whose subject has no user row, and a failed recheck or promotion. Nil
+	// disables logging.
 	Logf func(format string, args ...any)
 }
 
@@ -87,11 +130,68 @@ func (m *Middleware) Optional(next http.Handler) http.Handler {
 			return
 		}
 
+		if !u.EmailVerified {
+			claims, id, u = m.promote(r, claims, id, u)
+		}
+
 		ctx := WithIdentity(r.Context(), &id)
 		ctx = WithUser(ctx, &u)
 		ctx = WithClaims(ctx, claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// promote is the unverified-row path described on
+// [Middleware.UnverifiedRecheck]. It returns the claims, identity and user the
+// request should proceed with: the promoted ones on success, the ones it was
+// given on any fault. No fault here costs the request its user.
+func (m *Middleware) promote(r *http.Request, claims *oidclient.Claims, id Identity, u User) (*oidclient.Claims, Identity, User) {
+	given, givenID := claims, id
+	if !claims.EmailVerified {
+		rc, ok := m.Authenticator.(Rechecker)
+		if !ok || m.UnverifiedRecheck < 0 {
+			return claims, id, u
+		}
+		interval := m.UnverifiedRecheck
+		if interval == 0 {
+			interval = DefaultUnverifiedRecheck
+		}
+		fresh, err := rc.Recheck(r, interval)
+		if err != nil {
+			m.logf("oidclient/rpuser: recheck unverified subject %s: %v", id.Subject, err)
+			return claims, id, u
+		}
+		// The session cannot change hands between two reads of it; refuse to
+		// act on the answer if it somehow did.
+		if fresh.Sub != claims.Sub {
+			m.logf("oidclient/rpuser: recheck for subject %s answered for another subject; ignored", id.Subject)
+			return claims, id, u
+		}
+		if !fresh.EmailVerified {
+			return claims, id, u
+		}
+		claims, id = fresh, FromClaims(m.Issuer, fresh)
+	}
+
+	// The flag describes the address in the claims, so the two are written
+	// together -- the same rule as Provisioner.ProvisionIdentity.
+	email := u.Email
+	if id.Email != "" {
+		email = id.Email
+	}
+	if err := m.Store.SyncEmail(r.Context(), u.Key, email, true); err != nil {
+		m.logf("oidclient/rpuser: promote subject %s to verified: %v", id.Subject, err)
+		return given, givenID, u
+	}
+	// Re-read so User.Host is the host's row as it now stands, not the copy
+	// fetched before the write.
+	promoted, err := m.Store.LookupBySubject(r.Context(), id.Issuer, id.Subject)
+	if err != nil {
+		m.logf("oidclient/rpuser: re-read subject %s after promotion: %v", id.Subject, err)
+		u.Email, u.EmailVerified = email, true
+		return claims, id, u
+	}
+	return claims, id, promoted
 }
 
 type identityContextKey struct{}

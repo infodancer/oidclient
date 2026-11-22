@@ -53,7 +53,17 @@ func (f *fakeStore) LookupBySubject(_ context.Context, issuer, subject string) (
 
 func (f *fakeStore) SyncEmail(_ context.Context, key, email string, verified bool) error {
 	f.syncCalls = append(f.syncCalls, syncCall{key: key, email: email, verified: verified})
-	return f.syncErr
+	if f.syncErr != nil {
+		return f.syncErr
+	}
+	// Behave like a real store: a later lookup sees the write.
+	for k, u := range f.users {
+		if u.Key == key {
+			u.Email, u.EmailVerified = email, verified
+			f.users[k] = u
+		}
+	}
+	return nil
 }
 
 func (f *fakeStore) Create(_ context.Context, id Identity) (User, error) {
