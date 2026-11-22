@@ -60,6 +60,20 @@ type Claims struct {
 	// fails -- rather than reacting to a validation failure. Zero if the token
 	// carried no exp.
 	Exp int64 `json:"exp,omitempty"`
+
+	// Iat is when the token was issued, as a Unix timestamp (the JWT "iat"
+	// claim): how old the claims are, as opposed to how long they remain
+	// valid. Zero if the token carried no iat.
+	Iat int64 `json:"iat,omitempty"`
+}
+
+// IssuedAt returns when the token was issued, or the zero time if it carried
+// no iat claim.
+func (c *Claims) IssuedAt() time.Time {
+	if c.Iat == 0 {
+		return time.Time{}
+	}
+	return time.Unix(c.Iat, 0)
 }
 
 // ExpiresAt returns the token expiry as a time.Time, or the zero time if the
