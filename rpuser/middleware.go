@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/infodancer/oidclient"
@@ -72,9 +73,12 @@ type Middleware struct {
 	//
 	//   - if the session's claims do not say verified and the Authenticator is
 	//     a [Rechecker], it is asked for claims no older than this interval;
-	//   - if the claims then say verified, the row is promoted through
-	//     UserStore.SyncEmail -- the address from the claims together with the
-	//     flag, exactly what the next sign-in would have written -- and re-read.
+	//   - if the claims then say verified and name the address they mean, the
+	//     row is promoted through UserStore.SyncEmail -- that address together
+	//     with the flag -- and re-read. Claims that say verified but carry no
+	//     address are not acted on;
+	//   - a promotion the store refuses is not retried until the interval has
+	//     passed.
 	//
 	// This is the backstop, not the main route: a host should send the user
 	// back through sign-in when they finish verifying, which syncs at once.
@@ -88,6 +92,10 @@ type Middleware struct {
 	// whose subject has no user row, and a failed recheck or promotion. Nil
 	// disables logging.
 	Logf func(format string, args ...any)
+
+	// retry holds back a promotion write that just failed. Its presence means
+	// a Middleware must be used through a pointer and not copied once in use.
+	retry retryLog
 }
 
 func (m *Middleware) logf(format string, args ...any) {
@@ -141,20 +149,38 @@ func (m *Middleware) Optional(next http.Handler) http.Handler {
 	})
 }
 
+// attestsVerified reports whether the claims attest a verified address.
+// email_verified describes the address in the same claims; with no address
+// there is nothing it is true of, and acting on it would mark whatever address
+// the row already holds as verified.
+func attestsVerified(c *oidclient.Claims) bool {
+	return c.EmailVerified && c.Email != ""
+}
+
 // promote is the unverified-row path described on
 // [Middleware.UnverifiedRecheck]. It returns the claims, identity and user the
 // request should proceed with: the promoted ones on success, the ones it was
 // given on any fault. No fault here costs the request its user.
 func (m *Middleware) promote(r *http.Request, claims *oidclient.Claims, id Identity, u User) (*oidclient.Claims, Identity, User) {
+	interval := m.UnverifiedRecheck
+	if interval == 0 {
+		interval = DefaultUnverifiedRecheck
+	}
+
+	// A write that failed a moment ago is not retried until the interval has
+	// passed. Claims that already say verified skip the recheck below and its
+	// throttle, so without this a store that is down takes a failed write, and
+	// a log line, on every request the user makes.
+	now := time.Now()
+	if m.retry.blocked(u.Key, now) {
+		return claims, id, u
+	}
+
 	given, givenID := claims, id
-	if !claims.EmailVerified {
+	if !attestsVerified(claims) {
 		rc, ok := m.Authenticator.(Rechecker)
-		if !ok || m.UnverifiedRecheck < 0 {
+		if !ok || interval < 0 {
 			return claims, id, u
-		}
-		interval := m.UnverifiedRecheck
-		if interval == 0 {
-			interval = DefaultUnverifiedRecheck
 		}
 		fresh, err := rc.Recheck(r, interval)
 		if err != nil {
@@ -167,20 +193,21 @@ func (m *Middleware) promote(r *http.Request, claims *oidclient.Claims, id Ident
 			m.logf("oidclient/rpuser: recheck for subject %s answered for another subject; ignored", id.Subject)
 			return claims, id, u
 		}
-		if !fresh.EmailVerified {
+		if !attestsVerified(fresh) {
 			return claims, id, u
 		}
 		claims, id = fresh, FromClaims(m.Issuer, fresh)
 	}
 
-	// The flag describes the address in the claims, so the two are written
-	// together -- the same rule as Provisioner.ProvisionIdentity.
-	email := u.Email
-	if id.Email != "" {
-		email = id.Email
-	}
-	if err := m.Store.SyncEmail(r.Context(), u.Key, email, true); err != nil {
+	// The flag and the address it describes are written together. id.Email is
+	// non-empty here: attestsVerified required it.
+	if err := m.Store.SyncEmail(r.Context(), u.Key, id.Email, true); err != nil {
 		m.logf("oidclient/rpuser: promote subject %s to verified: %v", id.Subject, err)
+		backoff := interval
+		if backoff < 0 {
+			backoff = DefaultUnverifiedRecheck
+		}
+		m.retry.block(u.Key, now.Add(backoff), now)
 		return given, givenID, u
 	}
 	// Re-read so User.Host is the host's row as it now stands, not the copy
@@ -188,10 +215,51 @@ func (m *Middleware) promote(r *http.Request, claims *oidclient.Claims, id Ident
 	promoted, err := m.Store.LookupBySubject(r.Context(), id.Issuer, id.Subject)
 	if err != nil {
 		m.logf("oidclient/rpuser: re-read subject %s after promotion: %v", id.Subject, err)
-		u.Email, u.EmailVerified = email, true
+		u.Email, u.EmailVerified = id.Email, true
 		return claims, id, u
 	}
 	return claims, id, promoted
+}
+
+// retryPruneAt is the size at which retryLog sheds expired entries.
+const retryPruneAt = 1024
+
+// retryLog remembers, per user key, the time before which a failed promotion
+// write is not attempted again. Entries exist only for users whose write
+// failed and expire after one interval. It is per process.
+type retryLog struct {
+	mu    sync.Mutex
+	until map[string]time.Time
+}
+
+func (l *retryLog) blocked(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	t, ok := l.until[key]
+	return ok && now.Before(t)
+}
+
+func (l *retryLog) block(key string, until, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.until == nil {
+		l.until = make(map[string]time.Time)
+	}
+	if len(l.until) >= retryPruneAt {
+		for k, t := range l.until {
+			if !now.Before(t) {
+				delete(l.until, k)
+			}
+		}
+	}
+	l.until[key] = until
+}
+
+// clear forgets every backoff. For tests.
+func (l *retryLog) clear() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.until = nil
 }
 
 type identityContextKey struct{}

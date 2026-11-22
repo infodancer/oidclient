@@ -259,7 +259,7 @@ sign-in starts out unverified and the session's claims are as old as its access
 token. While a row is unverified the middleware asks the session manager for
 claims no older than `Middleware.UnverifiedRecheck` (default 5 minutes;
 negative disables) via `session.Manager.Recheck`, and promotes the row when they
-say verified. That is a backstop for the user who verifies in another browser.
+say verified and name the address. That is a backstop for the user who verifies in another browser.
 The main route is the host's: send the user back through sign-in when they
 finish verifying, which syncs immediately. Verified users are never rechecked.
 

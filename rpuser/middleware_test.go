@@ -327,3 +327,80 @@ func TestMiddleware_PlainAuthenticatorStillPromotes(t *testing.T) {
 		t.Errorf("syncs = %+v, user = %+v; want promoted", st.syncCalls, u)
 	}
 }
+
+// email_verified describes an address. Claims that say verified but name no
+// address attest nothing, and must not mark whatever address the row happens
+// to hold as verified -- whether they arrive with the session or from a
+// recheck.
+func TestMiddleware_VerifiedWithoutAnAddressDoesNotPromote(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		session, answer *oidclient.Claims
+	}{
+		{"session claims", &oidclient.Claims{Sub: "sub-1", EmailVerified: true}, nil},
+		{"recheck answer", &oidclient.Claims{Sub: "sub-1", Email: "a@example.com"}, &oidclient.Claims{Sub: "sub-1", EmailVerified: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.put(testIssuer, "sub-1", User{Key: "u1", Email: "never-verified@example.com"})
+			auth := &fakeRechecker{fakeAuthenticator: fakeAuthenticator{claims: tc.session}, rechecked: tc.answer}
+			m := &Middleware{Authenticator: auth, Store: st, Issuer: testIssuer}
+			_, u, _ := serveMW(t, m)
+			if len(st.syncCalls) != 0 {
+				t.Errorf("syncs = %+v, want none", st.syncCalls)
+			}
+			if u == nil || u.EmailVerified {
+				t.Errorf("user = %+v, want present and unverified", u)
+			}
+		})
+	}
+}
+
+// A store that keeps refusing the promotion must cost one write per interval,
+// not one per request: claims that already say verified skip the recheck and
+// its throttle, so the write needs its own.
+func TestMiddleware_FailedPromotionBacksOff(t *testing.T) {
+	var logged []string
+	st := newFakeStore()
+	st.syncErr = errors.New("db down")
+	st.put(testIssuer, "sub-1", User{Key: "u1", Email: "a@example.com"})
+	m := &Middleware{
+		Authenticator: &fakeAuthenticator{claims: &oidclient.Claims{Sub: "sub-1", Email: "a@example.com", EmailVerified: true}},
+		Store:         st, Issuer: testIssuer,
+		Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) },
+	}
+	for range 6 {
+		if _, u, _ := serveMW(t, m); u == nil || u.EmailVerified {
+			t.Fatalf("user = %+v, want present and unverified", u)
+		}
+	}
+	if len(st.syncCalls) != 1 {
+		t.Errorf("syncs = %d, want 1 inside the interval", len(st.syncCalls))
+	}
+	if len(logged) != 1 {
+		t.Errorf("logged %d times, want the fault reported once: %v", len(logged), logged)
+	}
+
+	// Once the store recovers and the interval has passed, promotion goes through.
+	st.syncErr = nil
+	m.retry.clear()
+	if _, u, _ := serveMW(t, m); !u.EmailVerified {
+		t.Error("promotion did not go through after the backoff ended")
+	}
+}
+
+// One user's failing write must not hold back another's.
+func TestMiddleware_BackoffIsPerUser(t *testing.T) {
+	st := newFakeStore()
+	st.syncErr = errors.New("db down")
+	st.put(testIssuer, "sub-1", User{Key: "u1", Email: "a@example.com"})
+	st.put(testIssuer, "sub-2", User{Key: "u2", Email: "b@example.com"})
+	auth := &fakeAuthenticator{claims: &oidclient.Claims{Sub: "sub-1", Email: "a@example.com", EmailVerified: true}}
+	m := &Middleware{Authenticator: auth, Store: st, Issuer: testIssuer}
+	serveMW(t, m)
+	auth.claims = &oidclient.Claims{Sub: "sub-2", Email: "b@example.com", EmailVerified: true}
+	serveMW(t, m)
+	if len(st.syncCalls) != 2 {
+		t.Errorf("syncs = %d, want one attempt per user", len(st.syncCalls))
+	}
+}
