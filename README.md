@@ -157,6 +157,13 @@ func requireAuth(next http.Handler) http.Handler {
 }
 ```
 
+`Validate` and `ValidateCookie` accept an access token only if its `aud` names
+this client's id, so a token the same issuer signed for another client is
+refused (`ErrWrongAudience`). For an issuer or grant that emits no `aud`, set
+`Config.AllowMissingAudience`; a token naming a different client is still
+refused. Upgrade the provider before a client that requires the claim: a
+session whose refreshed token fails validation cannot renew.
+
 ### Renewing a session
 
 Set `OfflineAccess: true` on the `Config` so the IdP issues a refresh token,

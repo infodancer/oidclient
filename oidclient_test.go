@@ -44,6 +44,23 @@ func fakeProvider(t *testing.T) (srv *httptest.Server, issuer string, issueToken
 // with the serving URL before the first request.
 func fakeProviderMux(t *testing.T) (mux *http.ServeMux, setBase func(string), issueToken func(sub, email string, ttl time.Duration) string) {
 	t.Helper()
+	mux, setBase, issueToken, _ = fakeProviderMuxKey(t)
+	return mux, setBase, issueToken
+}
+
+// fakeProviderWithKey is fakeProvider that also hands back the signing key, for
+// tests that mint tokens the shared issueToken helper cannot express.
+func fakeProviderWithKey(t *testing.T) (srv *httptest.Server, issuer string, issueToken func(sub, email string, ttl time.Duration) string, priv *rsa.PrivateKey) {
+	t.Helper()
+	mux, setBase, issueToken, priv := fakeProviderMuxKey(t)
+	srv = httptest.NewServer(mux)
+	setBase(srv.URL)
+	t.Cleanup(srv.Close)
+	return srv, srv.URL, issueToken, priv
+}
+
+func fakeProviderMuxKey(t *testing.T) (mux *http.ServeMux, setBase func(string), issueToken func(sub, email string, ttl time.Duration) string, priv *rsa.PrivateKey) {
+	t.Helper()
 	priv, pub := testKeyPair(t)
 	kid := "test-kid"
 
@@ -89,6 +106,7 @@ func fakeProviderMux(t *testing.T) (mux *http.ServeMux, setBase func(string), is
 		accessClaims := jwtgo.MapClaims{
 			"iss":   baseURL,
 			"sub":   "user-from-token",
+			"aud":   "test-client",
 			"email": "token@example.com",
 			"name":  "Token User",
 			"roles": []string{"user"},
@@ -130,6 +148,7 @@ func fakeProviderMux(t *testing.T) (mux *http.ServeMux, setBase func(string), is
 		claims := jwtgo.MapClaims{
 			"iss":   baseURL,
 			"sub":   sub,
+			"aud":   "test-client",
 			"email": email,
 			"name":  "Test User",
 			"roles": []string{"user"},
@@ -145,7 +164,7 @@ func fakeProviderMux(t *testing.T) (mux *http.ServeMux, setBase func(string), is
 		return signed
 	}
 
-	return mux, setBase, issueToken
+	return mux, setBase, issueToken, priv
 }
 
 // newTestClient creates a Client against the fake provider.
