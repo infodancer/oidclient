@@ -93,11 +93,26 @@ type User struct {
 // never-match-by-email rule even under a racing double-create.
 type UserStore interface {
 	// LookupBySubject returns the user for (issuer, subject), or [ErrNotFound].
-	// It is called on every authenticated request and must not write.
+	// It is called on every authenticated request -- twice on the one request
+	// that promotes a row -- and must not write.
 	LookupBySubject(ctx context.Context, issuer, subject string) (User, error)
 
 	// SyncEmail persists a changed email / email_verified pair on an existing
-	// row. Called at login only, when [Provisioner.Provision] detects a change.
+	// row. It has two callers: [Provisioner.Provision] at login, when it
+	// detects a change in either direction, and [Middleware.Optional] on an
+	// ordinary request -- of any method, a GET included -- when it promotes an
+	// unverified row to verified. The second caller only ever passes
+	// verified=true, and normally once per user.
+	//
+	// Because it can run inside any request, keep it to the update itself: no
+	// notifications, no work that assumes a login is in progress, nothing that
+	// is expensive or unsafe to repeat. A failure is retried after
+	// [Middleware.UnverifiedRecheck], so it must be idempotent.
+	//
+	// The stored flag mirrors the provider. A host that wants to mark an
+	// address unverified on its own authority should keep that in a column of
+	// its own: a value written here is overwritten by the provider's answer at
+	// the next login, and an unverified one by the next promotion.
 	SyncEmail(ctx context.Context, userKey, email string, verified bool) error
 
 	// Create inserts a row for a first login, keyed on (id.Issuer, id.Subject),
