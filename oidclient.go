@@ -66,6 +66,20 @@ type Claims struct {
 	// fails -- rather than reacting to a validation failure. Zero if the token
 	// carried no exp.
 	Exp int64 `json:"exp,omitempty"`
+
+	// Iat is when the token was issued, as a Unix timestamp (the JWT "iat"
+	// claim): how old the claims are, as opposed to how long they remain
+	// valid. Zero if the token carried no iat.
+	Iat int64 `json:"iat,omitempty"`
+}
+
+// IssuedAt returns when the token was issued, or the zero time if it carried
+// no iat claim.
+func (c *Claims) IssuedAt() time.Time {
+	if c.Iat == 0 {
+		return time.Time{}
+	}
+	return time.Unix(c.Iat, 0)
 }
 
 // ExpiresAt returns the token expiry as a time.Time, or the zero time if the
@@ -104,7 +118,8 @@ type Config struct {
 	// when the provider does not advertise a registration_endpoint. When the
 	// provider supports RFC 7591 dynamic client registration, this field is
 	// ignored and the server-assigned client_id is used instead — query the
-	// runtime value via Client.ClientID after New returns.
+	// runtime value via Client.ClientID after New returns. Set StaticClient to
+	// keep this id regardless.
 	ClientID string
 
 	// AllowMissingAudience accepts an access token that carries no aud claim.
@@ -118,6 +133,18 @@ type Config struct {
 	// It has no effect on the ID token at the callback, whose audience is
 	// always checked, or on [ResourceServer], which checks its own.
 	AllowMissingAudience bool
+
+	// StaticClient uses ClientID exactly as configured and never registers
+	// dynamically, even when the provider advertises a registration_endpoint.
+	//
+	// Set it when ClientID names a client the provider's operator registered
+	// by hand. Such a client can carry grants a self-registered one never can
+	// -- being trusted to skip a consent step, for one -- and without this
+	// option a provider that supports dynamic registration silently replaces
+	// it with a freshly registered client that has none of them. Requires
+	// ClientID. The client must already exist at the provider with
+	// CallbackURL among its redirect URIs, or sign-in fails there.
+	StaticClient bool
 
 	// ClientName is optional client metadata (RFC 7591 §2) sent during dynamic
 	// registration. Servers may use it for display in admin UIs and consent
@@ -240,6 +267,9 @@ func newClient(cfg Config) (*Client, error) {
 	if cfg.IssuerURL == "" {
 		return nil, fmt.Errorf("oidclient: IssuerURL is required")
 	}
+	if cfg.StaticClient && cfg.ClientID == "" {
+		return nil, fmt.Errorf("oidclient: StaticClient requires ClientID")
+	}
 
 	if cfg.WebauthURL == "" {
 		u, err := url.Parse(cfg.IssuerURL)
@@ -287,7 +317,7 @@ func (c *Client) connect(ctx context.Context) (*providerState, error) {
 	// registration (below) supersedes it when the provider supports RFC 7591.
 	clientID := c.cfg.ClientID
 	clientSecret := c.cfg.ClientSecret
-	if c.cfg.CallbackURL != "" {
+	if c.cfg.CallbackURL != "" && !c.cfg.StaticClient {
 		var meta struct {
 			RegistrationEndpoint string `json:"registration_endpoint"`
 		}

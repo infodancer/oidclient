@@ -379,3 +379,51 @@ func TestSweep(t *testing.T) {
 		t.Error("live row should remain")
 	}
 }
+
+// A session belongs to the subject it was started for. A renewal that comes
+// back for anyone else -- a provider fault, a mixed-up response -- must not
+// re-bind the session to them: it fails, and the stored tokens stay as they
+// were.
+func TestAuthenticate_RenewalForAnotherSubjectIsRefused(t *testing.T) {
+	store, kr := newMemStore(), testKeyring(t)
+	seed(t, store, kr, "sid", "stale-at", "rt-old", time.Now().Add(-time.Minute), time.Now().Add(24*time.Hour), 3)
+	ren := &fakeRenewer{
+		validate: func(string) (*oidclient.Claims, error) { return nil, errors.New("expired") },
+		refresh: func(string) (*oidclient.Tokens, *oidclient.Claims, error) {
+			return &oidclient.Tokens{AccessToken: "other-at", RefreshToken: "rt-new", Expiry: time.Now().Add(time.Hour)},
+				&oidclient.Claims{Sub: "user-2"}, nil
+		},
+	}
+	m := newManager(t, store, ren, kr)
+
+	claims, err := m.Authenticate(reqCookie("sid"))
+	if err == nil {
+		t.Fatalf("Authenticate returned claims for %q on a session started for user-1", claims.Sub)
+	}
+	if errors.Is(err, ErrNoSession) {
+		t.Error("a subject mismatch must be a real error, not ErrNoSession, so the host logs it")
+	}
+	got := store.rows["sid"]
+	if got.Version != 3 {
+		t.Errorf("version = %d, want 3: the other subject's tokens were persisted", got.Version)
+	}
+	if at, _ := kr.Open(got.AccessToken, []byte("sid")); string(at) != "stale-at" {
+		t.Errorf("stored access token = %q, want it untouched", at)
+	}
+}
+
+// The same holds for a stored token that validates for someone else.
+func TestAuthenticate_StoredTokenForAnotherSubjectIsRefused(t *testing.T) {
+	store, kr := newMemStore(), testKeyring(t)
+	seed(t, store, kr, "sid", "good-at", "rt-1", time.Now().Add(time.Hour), time.Now().Add(24*time.Hour), 0)
+	ren := &fakeRenewer{
+		validate: func(string) (*oidclient.Claims, error) { return &oidclient.Claims{Sub: "user-2"}, nil },
+		refresh: func(string) (*oidclient.Tokens, *oidclient.Claims, error) {
+			return nil, nil, errors.New("refresh token revoked")
+		},
+	}
+	m := newManager(t, store, ren, kr)
+	if claims, err := m.Authenticate(reqCookie("sid")); err == nil {
+		t.Fatalf("Authenticate returned claims for %q on a session started for user-1", claims.Sub)
+	}
+}

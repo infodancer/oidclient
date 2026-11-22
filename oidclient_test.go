@@ -456,6 +456,7 @@ type registrationRecord struct {
 	responseExtra map[string]any // e.g. client_secret
 	responseCode  int            // 201 or 200; 0 means use 201
 	responseError string         // if set, returns this with responseCode (default 400)
+	called        bool           // the registration endpoint was hit at all
 }
 
 // tokenCapture records the form values sent to the fake token endpoint so
@@ -507,6 +508,7 @@ func fakeProviderWithRegistration(t *testing.T, rec *registrationRecord) (srv *h
 	})
 
 	mux.HandleFunc("/register-client", func(w http.ResponseWriter, r *http.Request) {
+		rec.called = true
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -903,5 +905,50 @@ func TestLogoutURL_FallsBackWhenUnadvertised(t *testing.T) {
 	// No end_session_endpoint advertised -> legacy WebauthURL/logout fallback.
 	if got, want := c.LogoutURL(), "https://auth.example.com/logout"; got != want {
 		t.Errorf("LogoutURL() = %q, want legacy fallback %q", got, want)
+	}
+}
+
+// A client the operator registered by hand, and may have granted things a
+// self-registered client can never have, must be used as configured even when
+// the provider would happily register a new one.
+func TestStaticClient_SkipsRegistrationAndUsesConfiguredID(t *testing.T) {
+	rec := &registrationRecord{responseID: "server-assigned-id"}
+	srv, issuer, tokCap := fakeProviderWithRegistration(t, rec)
+
+	c, err := New(context.Background(), Config{
+		IssuerURL:    issuer,
+		CookieName:   "test_jwt",
+		ClientID:     "operator-registered",
+		StaticClient: true,
+		CallbackURL:  srv.URL + "/auth/callback",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if rec.called {
+		t.Error("the registration endpoint was called for a static client")
+	}
+	if c.ClientID() != "operator-registered" {
+		t.Errorf("Client.ClientID() = %q, want operator-registered", c.ClientID())
+	}
+	if !strings.Contains(c.AuthorizeURL("s", "v"), "client_id=operator-registered") {
+		t.Errorf("AuthorizeURL = %q, want the configured client id", c.AuthorizeURL("s", "v"))
+	}
+	if _, _, err := c.ExchangeCode(context.Background(), "code", "verifier"); err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if tokCap.clientID != "operator-registered" {
+		t.Errorf("token request client_id = %q, want operator-registered", tokCap.clientID)
+	}
+}
+
+// StaticClient with no id to be static about is a misconfiguration, caught
+// before any network call.
+func TestStaticClient_RequiresAClientID(t *testing.T) {
+	if _, err := New(context.Background(), Config{IssuerURL: "https://issuer.invalid", StaticClient: true, CallbackURL: "https://app.invalid/cb"}); err == nil {
+		t.Fatal("want an error for StaticClient without ClientID")
+	}
+	if _, err := NewLazy(context.Background(), Config{IssuerURL: "https://issuer.invalid", StaticClient: true}); err == nil {
+		t.Fatal("NewLazy: want an error for StaticClient without ClientID")
 	}
 }
