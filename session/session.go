@@ -36,6 +36,12 @@ const (
 // should be logged.
 var ErrNoSession = errors.New("oidclient/session: no session")
 
+// ErrSubjectChanged is returned when a renewal answers for a subject other
+// than the one the session was started for. It is a fault at the provider, or
+// a Store that does not persist Session.UserSub; either way the session cannot
+// be trusted and is not renewed.
+var ErrSubjectChanged = errors.New("oidclient/session: renewal answered for a different subject")
+
 // ErrNotFound is what a Store.Get returns when no row matches the id. The
 // Manager maps it to ErrNoSession.
 var ErrNotFound = errors.New("oidclient/session: not found")
@@ -46,7 +52,7 @@ var ErrNotFound = errors.New("oidclient/session: not found")
 // tokens.
 type Session struct {
 	ID             string // opaque session id; the cookie value
-	UserSub        string // claims.Sub, for the host's user lookup
+	UserSub        string // claims.Sub; a Store must persist it -- every token is checked against it
 	AccessToken    []byte // AES-GCM ciphertext
 	RefreshToken   []byte // AES-GCM ciphertext
 	Version        int64  // compare-and-swap guard for rotation
@@ -260,6 +266,12 @@ func (m *Manager) renew(sess Session, fresh func(*oidclient.Claims) bool) (*oidc
 		if err != nil {
 			return nil, fmt.Errorf("oidclient/session: refresh: %w", err)
 		}
+		// A session belongs to the subject it was started for. Tokens that
+		// come back for anyone else are not persisted: storing them would hand
+		// this cookie to another user.
+		if claims.Sub != cur.UserSub {
+			return nil, ErrSubjectChanged
+		}
 		access, sealedRefresh, err := m.sealTokens(cur.ID, tokens)
 		if err != nil {
 			return nil, err
@@ -302,6 +314,10 @@ func (m *Manager) tryStoredAccessToken(ctx context.Context, sess Session) (*oidc
 	}
 	claims, err := m.renewer.Validate(ctx, string(at))
 	if err != nil {
+		return nil, false
+	}
+	// Valid, but for someone else: not this session's token.
+	if claims.Sub != sess.UserSub {
 		return nil, false
 	}
 	return claims, true
