@@ -84,6 +84,14 @@ request body together with the PKCE verifier. Leave it empty for public PKCE
 clients. If the provider *does* advertise `registration_endpoint`, dynamic
 registration runs and the server-assigned secret supersedes `ClientSecret`.
 
+To keep a hand-registered client on a provider that also offers dynamic
+registration, set `Config.StaticClient`. `ClientID` is then used exactly as
+configured and no registration request is made. This matters when the
+operator has granted that client something a self-registered client cannot
+have, such as being trusted to skip a consent step: without the option the
+configured id is silently replaced by a newly registered client with none of
+it.
+
 ### Starting the login flow
 
 ```go
