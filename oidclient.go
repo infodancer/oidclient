@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -45,6 +46,11 @@ var (
 	// provider discovery has not yet succeeded. Treat it as "anonymous" on
 	// validation paths and as "sign-in temporarily unavailable" on flow paths.
 	ErrNotReady = errors.New("oidclient: provider not ready")
+
+	// ErrWrongAudience is returned by [Client.Validate] for an access token
+	// that was not issued to this client: its aud names other clients, or it
+	// has no aud and [Config.AllowMissingAudience] is not set.
+	ErrWrongAudience = errors.New("oidclient: token was not issued to this client")
 )
 
 // Claims holds the JWT claims extracted from an ID or access token.
@@ -100,6 +106,18 @@ type Config struct {
 	// ignored and the server-assigned client_id is used instead — query the
 	// runtime value via Client.ClientID after New returns.
 	ClientID string
+
+	// AllowMissingAudience accepts an access token that carries no aud claim.
+	//
+	// By default [Client.Validate] requires an access token's aud to name this
+	// client, so that a token the same issuer signed for a different client is
+	// not accepted here. Set this only for an issuer, or a grant, that does
+	// not emit the claim. It excuses absence and nothing else: a token whose
+	// aud names other clients is refused either way.
+	//
+	// It has no effect on the ID token at the callback, whose audience is
+	// always checked, or on [ResourceServer], which checks its own.
+	AllowMissingAudience bool
 
 	// ClientName is optional client metadata (RFC 7591 §2) sent during dynamic
 	// registration. Servers may use it for display in admin UIs and consent
@@ -311,8 +329,9 @@ func (c *Client) connect(ctx context.Context) (*providerState, error) {
 		ClientID: clientID,
 	})
 
-	// Access token verifier: skips audience check because webauth access
-	// tokens don't carry an aud claim matching the client ID.
+	// Access token verifier: the library's own audience check is off because
+	// it cannot express "absent is acceptable when the caller opted out".
+	// Validate checks aud itself, against the client id in effect.
 	accessVerifier := provider.Verifier(&oidc.Config{
 		SkipClientIDCheck: true,
 	})
@@ -558,6 +577,9 @@ func (c *Client) Validate(ctx context.Context, tokenStr string) (*Claims, error)
 	if err != nil {
 		return nil, fmt.Errorf("oidclient: invalid token: %w", err)
 	}
+	if err := checkAudience(tok.Audience, st.clientID, c.cfg.AllowMissingAudience); err != nil {
+		return nil, err
+	}
 
 	var cl Claims
 	if err := tok.Claims(&cl); err != nil {
@@ -567,6 +589,34 @@ func (c *Client) Validate(ctx context.Context, tokenStr string) (*Claims, error)
 		return nil, ErrMissingSub
 	}
 	return &cl, nil
+}
+
+// checkAudience decides whether a verified access token was issued to this
+// client. The signature only proves the issuer signed it; every client of that
+// issuer holds tokens that pass that test, so without this a token obtained by
+// one of them is accepted by all.
+//
+//   - aud names clientID: accepted.
+//   - aud is present and does not: refused, always.
+//   - aud is absent: refused unless allowMissing.
+//
+// A Client with no client id is validating tokens without being a client of
+// its own, and has nothing for a token to be bound to; nothing is required of
+// it.
+func checkAudience(aud []string, clientID string, allowMissing bool) error {
+	if clientID == "" {
+		return nil
+	}
+	if len(aud) == 0 {
+		if allowMissing {
+			return nil
+		}
+		return fmt.Errorf("%w: no aud claim", ErrWrongAudience)
+	}
+	if slices.Contains(aud, clientID) {
+		return nil
+	}
+	return fmt.Errorf("%w: aud %v does not name %s", ErrWrongAudience, aud, clientID)
 }
 
 // LoginURL returns a URL to redirect unauthenticated users to the IdP login.

@@ -72,7 +72,7 @@ func newRefreshProvider(t *testing.T, audience string) *refreshProvider {
 
 		now := time.Now()
 		base := jwtgo.MapClaims{
-			"iss": baseURL, "sub": "user-9", "email": "u@example.com",
+			"iss": baseURL, "sub": "user-9", "aud": audience, "email": "u@example.com",
 			"name": "Refresh User", "roles": []string{"user"},
 			"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
 		}

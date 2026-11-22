@@ -19,11 +19,12 @@ import (
 // the same package, but the two roles differ in ways that make [Client] the
 // wrong type for the second job:
 //
-//   - A resource server MUST check the audience. [Client] deliberately skips it
-//     (SkipClientIDCheck), because a website validating its own session cookie
-//     has no audience to compare against. For a resource server, that check is
-//     the control that stops one application replaying its users' tokens
-//     against a peer on the same issuer.
+//   - The two check the audience against different things. [Client] requires
+//     aud to name its own client id: the token must be one it obtained. A
+//     resource server accepts tokens obtained by other clients by design, and
+//     requires aud to name the resource instead. Either way it is the control
+//     that stops one application replaying its users' tokens against a peer
+//     on the same issuer.
 //   - A resource server runs no flows, so it must never register itself as a
 //     client. [Client]'s constructor auto-registers via RFC 7591 whenever the
 //     provider advertises a registration endpoint.
